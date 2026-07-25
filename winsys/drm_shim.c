@@ -72,6 +72,17 @@ static void shim_log(const char *fmt, ...)
 #define SHIM_LOG(...) ((void)0)
 #endif
 
+/* Exported one-line trace so other TUs (switch_libc_shim.c) can log into the
+ * same sink. No-op unless built with DRM_SHIM_DEBUG. */
+void drm_shim_dbg(const char *msg)
+{
+#ifdef DRM_SHIM_DEBUG
+   shim_log("%s", msg);
+#else
+   (void)msg;
+#endif
+}
+
 /* ------------------------------------------------------------------------- */
 /* Synthetic device model. The Switch has exactly one GPU, so one global       */
 /* device guarded by a mutex; the shim fd is a sentinel that can never alias   */
@@ -312,10 +323,29 @@ void *drm_shim_mmap(int fd, off_t map_handle, size_t length)
    if (!drm_shim_owns_fd(fd)) { errno = EBADF; return NULL; }
    mutexLock(&g_dev.lock);
    struct shim_bo *bo = bo_lookup((uint32_t)map_handle);
+   unsigned long long bosz = bo ? (unsigned long long)bo->size : 0ull;
    void *cpu = (bo && length <= bo->size) ? bo->cpu : NULL;
    mutexUnlock(&g_dev.lock);
+   SHIM_LOG("mmap handle=%llu length=0x%llx bo=%s bo_size=0x%llx -> cpu=%p\n",
+            (unsigned long long)map_handle, (unsigned long long)length,
+            bo ? "found" : "NULL", bosz, cpu);
    if (!cpu) errno = EINVAL;
    return cpu;
+}
+
+/* True if `addr` is the CPU backing of a live shim BO. A host process that
+ * provides its own mmap/munmap (e.g. skate3's rexglue mman shim) uses this to
+ * avoid free()ing BO memory the shim still owns (it is released on GEM close). */
+bool drm_shim_owns_ptr(const void *addr)
+{
+   if (!addr) return false;
+   bool owned = false;
+   mutexLock(&g_dev.lock);
+   for (int i = 0; i < SHIM_MAX_BOS; i++) {
+      if (g_dev.bos[i].used && g_dev.bos[i].cpu == addr) { owned = true; break; }
+   }
+   mutexUnlock(&g_dev.lock);
+   return owned;
 }
 
 int drm_shim_munmap(void *addr, size_t length)

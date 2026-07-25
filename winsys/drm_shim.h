@@ -60,6 +60,13 @@ uint64_t drm_shim_va_base(uint64_t *size_out);
 void *drm_shim_mmap(int fd, off_t map_handle, size_t length);
 int   drm_shim_munmap(void *addr, size_t length);
 
+/* True if `addr` is the CPU backing of a live shim BO (so a host-provided
+ * munmap knows not to free memory the shim still owns). */
+bool drm_shim_owns_ptr(const void *addr);
+
+/* One-line trace into the shim's debug log (no-op unless DRM_SHIM_DEBUG). */
+void drm_shim_dbg(const char *msg);
+
 #ifdef __cplusplus
 }
 #endif

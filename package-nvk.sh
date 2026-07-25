@@ -19,8 +19,12 @@ ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
 INC="-I$DKP/libnx/include -I/opt/switch-cross-include -Imesa-25/include -Imesa-25/src/nouveau/drm -Iwinsys -Icompat"
 DEFS="-D__SWITCH__ -D_GNU_SOURCE -D_DEFAULT_SOURCE -include /work/compat/switch_compat.h"
 
+# Set DRM_SHIM_DEBUG=1 in the environment to compile the drm_shim with its
+# per-op trace enabled (writes sdmc:/nvk_drmshim.log). Off by default (release).
+SHIM_DEBUG_DEFS="${DRM_SHIM_DEBUG:+-DDRM_SHIM_DEBUG}"
+
 echo "=== [1/4] compiling winsys shims (drm_shim + libc shim + compat) ==="
-$GCC -c winsys/drm_shim.c           -o "$OBJ/drm_shim.o"           $ARCH $DEFS $INC -O2
+$GCC -c winsys/drm_shim.c           -o "$OBJ/drm_shim.o"           $ARCH $DEFS $SHIM_DEBUG_DEFS $INC -O2
 $GCC -c winsys/switch_libc_shim.c   -o "$OBJ/switch_libc_shim.o"   $ARCH $DEFS $INC -O2
 $GCC -c compat/compat.c             -o "$OBJ/compat.o"            $ARCH $DEFS $INC -O2
 # loaderless-ICD glue: provides __wrap_vk_icdGetInstanceProcAddr (needs -Wl,--wrap at the consumer

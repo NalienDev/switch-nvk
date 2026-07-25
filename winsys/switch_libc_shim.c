@@ -28,6 +28,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -103,7 +104,14 @@ int __wrap_lstat(const char *path, struct stat *st)
  * fails cleanly. */
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
-   (void)addr; (void)prot; (void)flags;
+   (void)addr; (void)prot;
+   {
+      char buf[176];
+      snprintf(buf, sizeof(buf),
+               "libc mmap fd=0x%x len=0x%zx prot=0x%x flags=0x%x off=0x%lx owned=%d\n",
+               fd, length, prot, flags, (long)offset, (int)drm_shim_owns_fd(fd));
+      drm_shim_dbg(buf);
+   }
    if (drm_shim_owns_fd(fd)) {
       void *p = drm_shim_mmap(fd, offset, length);
       return p ? p : MAP_FAILED;

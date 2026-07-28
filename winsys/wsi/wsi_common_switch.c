@@ -331,7 +331,15 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
        * Vulkan's mapping is exact: timeout 0 means poll -> VK_NOT_READY; a finite
        * timeout that expires -> VK_TIMEOUT; an infinite timeout just keeps
        * waiting. */
-      const uint64_t timeout_ns = info ? info->timeout : UINT64_MAX;
+      /* Cap an "infinite" wait. The consumer calls this from its UI thread, and
+       * blocking there forever is its own hazard; VK_TIMEOUT is a legal,
+       * non-fatal result that means "no image right now" -- the consumer skips
+       * the frame and tries again, which is what should happen when the
+       * compositor is simply busy. */
+      const uint64_t kMaxBlockNs = 500000000ull; /* 0.5 s */
+      uint64_t timeout_ns = info ? info->timeout : UINT64_MAX;
+      if (timeout_ns > kMaxBlockNs)
+         timeout_ns = kMaxBlockNs;
       const uint64_t slice_ns = 200000ull; /* 0.2 ms */
       uint64_t waited_ns = 0;
       Result rc;
@@ -341,7 +349,7 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
             break;
          if (timeout_ns == 0)
             return VK_NOT_READY;
-         if (timeout_ns != UINT64_MAX && waited_ns >= timeout_ns)
+         if (waited_ns >= timeout_ns)
             return VK_TIMEOUT;
          svcSleepThread(slice_ns);
          waited_ns += slice_ns;
@@ -366,7 +374,10 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
     * timeout, and an infinite-timeout acquire is required to block. The consumer
     * treats NOT_READY as an outdated swapchain and rebuilds it, which is exactly
     * what must not happen just because all images are momentarily in flight. */
-   const uint64_t timeout_ns = info ? info->timeout : UINT64_MAX;
+   const uint64_t kMaxBlockNs = 500000000ull; /* 0.5 s -- see the note above */
+   uint64_t timeout_ns = info ? info->timeout : UINT64_MAX;
+   if (timeout_ns > kMaxBlockNs)
+      timeout_ns = kMaxBlockNs;
    const uint64_t slice_ns = 200000ull; /* 0.2 ms */
    uint64_t waited_ns = 0;
    for (;;) {
@@ -381,7 +392,7 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
       }
       if (timeout_ns == 0)
          return VK_NOT_READY;
-      if (timeout_ns != UINT64_MAX && waited_ns >= timeout_ns)
+      if (waited_ns >= timeout_ns)
          return VK_TIMEOUT;
       svcSleepThread(slice_ns);
       waited_ns += slice_ns;

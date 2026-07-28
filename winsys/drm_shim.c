@@ -72,6 +72,26 @@ static void shim_log(const char *fmt, ...)
 #define SHIM_LOG(...) ((void)0)
 #endif
 
+/* Error reporting that survives a RELEASE build.
+ *
+ * SHIM_LOG is compiled out without DRM_SHIM_DEBUG, so a release shim detects GPU
+ * faults and then says nothing at all. Those are exactly the events a consumer
+ * has to know about, so route them through a sink hook that is always present.
+ * Kept tiny and allocation-free: it runs on the submit path. */
+void (*g_drm_shim_err_sink)(const char *) = NULL;
+static void shim_err(const char *fmt, ...)
+{
+   char buf[192];
+   va_list ap;
+   va_start(ap, fmt);
+   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+   va_end(ap);
+   if (n <= 0)
+      return;
+   if (g_drm_shim_err_sink) { g_drm_shim_err_sink(buf); return; }
+   if (g_drm_shim_log_sink) { g_drm_shim_log_sink(buf); return; }
+}
+
 /* Exported one-line trace so other TUs (switch_libc_shim.c) can log into the
  * same sink. No-op unless built with DRM_SHIM_DEBUG. */
 void drm_shim_dbg(const char *msg)
@@ -1013,6 +1033,17 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
    Result wr = nvFenceWait(&fence, 2000000LL);
    SHIM_LOG("EXEC drain chan=%u fence=%u/%u rc=0x%x\n",
             (unsigned)req->channel, fence.id, fence.value, wr);
+   if (R_FAILED(wr)) {
+      /* The GPU did not finish this submit. Reporting success here told NVK to
+       * keep queueing work onto a channel that is stuck or has already been reset
+       * by the kernel, and the display stack went down with it -- the whole
+       * console hung and needed a power-button hold. Failing the submit turns
+       * that into VK_ERROR_DEVICE_LOST, which the consumer can report and exit
+       * on. */
+      shim_err("drm_shim: EXEC drain TIMEOUT chan=%u fence=%u/%u rc=0x%x\n",
+               (unsigned)req->channel, fence.id, fence.value, wr);
+      return -ETIMEDOUT;
+   }
 
    /* DIAG: read the CURRENT syncpt value vs the target. On a drain TIMEOUT this
     * pinpoints WHERE the GPU work stalled: current≈0 => the init never started /
@@ -1047,6 +1078,14 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
                   err.type, err.info[0], err.info[1], err.info[2], err.info[3],
                   err.info[4], err.info[5], err.info[6], err.info[7],
                   err.info[8], err.info[9], err.info[10], err.info[11]);
+
+      /* The GPU faulted. The kernel has reset this channel, so every later submit
+       * on it is meaningless; reporting success just kept NVK feeding a dead
+       * channel until the display stack died with it. Surface it instead. */
+      shim_err("drm_shim: GPU FAULT chan=%u type=%u info16=%u "
+               "(31=MMU 25=illegal-method 32=PBDMA 8=idle)\n",
+               (unsigned)req->channel, notif.info32, notif.info16);
+      return -EIO;
    }
 
    return 0;

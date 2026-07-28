@@ -317,10 +317,36 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
       NvMultiFence mf;
       memset(&mf, 0, sizeof(mf));
       if (trace) { printf("[wsi-zc] acquire: dequeue...\n"); fflush(stdout); }
-      Result rc = nwindowDequeueBuffer(chain->window, &slot, &mf);
+
+      /* Honour the caller's timeout.
+       *
+       * nwindowDequeueBuffer fails transiently whenever the compositor has not
+       * released a buffer yet, and returning VK_NOT_READY for that is a spec
+       * violation on any non-zero timeout -- with UINT64_MAX the call is required
+       * to BLOCK until an image is available. Reporting NOT_READY there made the
+       * consumer treat the swapchain as outdated and rebuild it while the
+       * compositor still owned buffers, which is a good way to wedge the display
+       * server (observed: the whole console hanging while the main menu loaded).
+       *
+       * Vulkan's mapping is exact: timeout 0 means poll -> VK_NOT_READY; a finite
+       * timeout that expires -> VK_TIMEOUT; an infinite timeout just keeps
+       * waiting. */
+      const uint64_t timeout_ns = info ? info->timeout : UINT64_MAX;
+      const uint64_t slice_ns = 200000ull; /* 0.2 ms */
+      uint64_t waited_ns = 0;
+      Result rc;
+      for (;;) {
+         rc = nwindowDequeueBuffer(chain->window, &slot, &mf);
+         if (R_SUCCEEDED(rc))
+            break;
+         if (timeout_ns == 0)
+            return VK_NOT_READY;
+         if (timeout_ns != UINT64_MAX && waited_ns >= timeout_ns)
+            return VK_TIMEOUT;
+         svcSleepThread(slice_ns);
+         waited_ns += slice_ns;
+      }
       if (trace) { printf("[wsi-zc] acquire: dequeue -> 0x%x slot=%d\n", (unsigned)rc, slot); fflush(stdout); }
-      if (R_FAILED(rc))
-         return VK_NOT_READY;
       if (slot < 0 || (uint32_t)slot >= chain->base.image_count) {
          nwindowCancelBuffer(chain->window, slot, NULL);
          return VK_ERROR_OUT_OF_DATE_KHR;

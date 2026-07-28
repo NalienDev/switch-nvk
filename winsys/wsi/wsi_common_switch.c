@@ -318,42 +318,22 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
       memset(&mf, 0, sizeof(mf));
       if (trace) { printf("[wsi-zc] acquire: dequeue...\n"); fflush(stdout); }
 
-      /* Honour the caller's timeout.
+      /* Report honestly and return; do NOT retry in here.
        *
-       * nwindowDequeueBuffer fails transiently whenever the compositor has not
-       * released a buffer yet, and returning VK_NOT_READY for that is a spec
-       * violation on any non-zero timeout -- with UINT64_MAX the call is required
-       * to BLOCK until an image is available. Reporting NOT_READY there made the
-       * consumer treat the swapchain as outdated and rebuild it while the
-       * compositor still owned buffers, which is a good way to wedge the display
-       * server (observed: the whole console hanging while the main menu loaded).
+       * A retry loop lived here and had to sleep. Calling libnx from inside a
+       * mesa-built object jumps through a GOT slot the NRO does not relocate:
+       * svcSleepThread resolved to image base + 0, and the loop died on its first
+       * sleep (LR pointed straight at this function). The consumer's own code
+       * links normally, so the waiting belongs there.
        *
-       * Vulkan's mapping is exact: timeout 0 means poll -> VK_NOT_READY; a finite
-       * timeout that expires -> VK_TIMEOUT; an infinite timeout just keeps
-       * waiting. */
-      /* Cap an "infinite" wait. The consumer calls this from its UI thread, and
-       * blocking there forever is its own hazard; VK_TIMEOUT is a legal,
-       * non-fatal result that means "no image right now" -- the consumer skips
-       * the frame and tries again, which is what should happen when the
-       * compositor is simply busy. */
-      const uint64_t kMaxBlockNs = 500000000ull; /* 0.5 s */
-      uint64_t timeout_ns = info ? info->timeout : UINT64_MAX;
-      if (timeout_ns > kMaxBlockNs)
-         timeout_ns = kMaxBlockNs;
-      const uint64_t slice_ns = 200000ull; /* 0.2 ms */
-      uint64_t waited_ns = 0;
-      Result rc;
-      for (;;) {
-         rc = nwindowDequeueBuffer(chain->window, &slot, &mf);
-         if (R_SUCCEEDED(rc))
-            break;
-         if (timeout_ns == 0)
-            return VK_NOT_READY;
-         if (waited_ns >= timeout_ns)
-            return VK_TIMEOUT;
-         svcSleepThread(slice_ns);
-         waited_ns += slice_ns;
-      }
+       * VK_TIMEOUT rather than VK_NOT_READY whenever the caller allowed any time:
+       * both mean "no image right now", but NOT_READY is only correct for a zero
+       * timeout -- and neither may be read as "the swapchain is stale", which is
+       * what led to it being torn down under the compositor.
+       */
+      Result rc = nwindowDequeueBuffer(chain->window, &slot, &mf);
+      if (R_FAILED(rc))
+         return (info && info->timeout == 0) ? VK_NOT_READY : VK_TIMEOUT;
       if (trace) { printf("[wsi-zc] acquire: dequeue -> 0x%x slot=%d\n", (unsigned)rc, slot); fflush(stdout); }
       if (slot < 0 || (uint32_t)slot >= chain->base.image_count) {
          nwindowCancelBuffer(chain->window, slot, NULL);
@@ -367,36 +347,19 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
       return VK_SUCCESS;
    }
 
-   /* Fallback (non-zero-copy): round-robin a free render image.
-    *
-    * Same timeout contract as the zero-copy path above -- this returned
-    * VK_NOT_READY the moment every image was busy, regardless of the caller's
-    * timeout, and an infinite-timeout acquire is required to block. The consumer
-    * treats NOT_READY as an outdated swapchain and rebuilds it, which is exactly
-    * what must not happen just because all images are momentarily in flight. */
-   const uint64_t kMaxBlockNs = 500000000ull; /* 0.5 s -- see the note above */
-   uint64_t timeout_ns = info ? info->timeout : UINT64_MAX;
-   if (timeout_ns > kMaxBlockNs)
-      timeout_ns = kMaxBlockNs;
-   const uint64_t slice_ns = 200000ull; /* 0.2 ms */
-   uint64_t waited_ns = 0;
-   for (;;) {
-      for (uint32_t n = 0; n < chain->base.image_count; n++) {
-         uint32_t i = (chain->next + n) % chain->base.image_count;
-         if (!chain->images[i].busy) {
-            chain->images[i].busy = true;
-            chain->next = (i + 1) % chain->base.image_count;
-            *image_index = i;
-            return VK_SUCCESS;
-         }
+   /* Fallback (non-zero-copy): round-robin a free render image. Same contract as
+    * the zero-copy branch -- report "no image right now" and let the consumer
+    * decide how long to wait. No sleeping in here; see the note above. */
+   for (uint32_t n = 0; n < chain->base.image_count; n++) {
+      uint32_t i = (chain->next + n) % chain->base.image_count;
+      if (!chain->images[i].busy) {
+         chain->images[i].busy = true;
+         chain->next = (i + 1) % chain->base.image_count;
+         *image_index = i;
+         return VK_SUCCESS;
       }
-      if (timeout_ns == 0)
-         return VK_NOT_READY;
-      if (waited_ns >= timeout_ns)
-         return VK_TIMEOUT;
-      svcSleepThread(slice_ns);
-      waited_ns += slice_ns;
    }
+   return (info && info->timeout == 0) ? VK_NOT_READY : VK_TIMEOUT;
 }
 
 static VkResult

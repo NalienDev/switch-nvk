@@ -359,17 +359,33 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
       return VK_SUCCESS;
    }
 
-   /* Fallback (non-zero-copy): round-robin a free render image. */
-   for (uint32_t n = 0; n < chain->base.image_count; n++) {
-      uint32_t i = (chain->next + n) % chain->base.image_count;
-      if (!chain->images[i].busy) {
-         chain->images[i].busy = true;
-         chain->next = (i + 1) % chain->base.image_count;
-         *image_index = i;
-         return VK_SUCCESS;
+   /* Fallback (non-zero-copy): round-robin a free render image.
+    *
+    * Same timeout contract as the zero-copy path above -- this returned
+    * VK_NOT_READY the moment every image was busy, regardless of the caller's
+    * timeout, and an infinite-timeout acquire is required to block. The consumer
+    * treats NOT_READY as an outdated swapchain and rebuilds it, which is exactly
+    * what must not happen just because all images are momentarily in flight. */
+   const uint64_t timeout_ns = info ? info->timeout : UINT64_MAX;
+   const uint64_t slice_ns = 200000ull; /* 0.2 ms */
+   uint64_t waited_ns = 0;
+   for (;;) {
+      for (uint32_t n = 0; n < chain->base.image_count; n++) {
+         uint32_t i = (chain->next + n) % chain->base.image_count;
+         if (!chain->images[i].busy) {
+            chain->images[i].busy = true;
+            chain->next = (i + 1) % chain->base.image_count;
+            *image_index = i;
+            return VK_SUCCESS;
+         }
       }
+      if (timeout_ns == 0)
+         return VK_NOT_READY;
+      if (timeout_ns != UINT64_MAX && waited_ns >= timeout_ns)
+         return VK_TIMEOUT;
+      svcSleepThread(slice_ns);
+      waited_ns += slice_ns;
    }
-   return VK_NOT_READY;
 }
 
 static VkResult

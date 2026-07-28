@@ -181,3 +181,37 @@ I VERIFY OK: all 1024 words == 0xcafebabe
 
 See `docs/knowledge/` for the full debugging-pattern and research trail, and `RESUME_NVK.md` for the
 moment-to-moment state.
+
+## Rebuilding after a WSI change (READ THIS FIRST)
+
+`package-nvk.sh` does NOT build mesa. It compiles the three winsys shims and
+MRI-merges *prebuilt* archives out of `mb/`. `wsi_common_switch.c` is copied into
+the mesa tree by `apply-wsi-switch.sh` and compiled as part of mesa, and it lands
+in `src/nouveau/vulkan/libnvk.a` (not in the un-merged `libvulkan_wsi.a`).
+
+So editing the WSI and running `package-nvk.sh` ships the OLD object, and looks
+exactly like a fix that did not work.
+
+Worse: **ninja does not reliably notice the change**. The repo is a Windows bind
+mount, and the container clock is offset from the host, so mtime comparisons say
+"up to date" when they are not. Delete the object to force it:
+
+```sh
+bash winsys/wsi/apply-wsi-switch.sh /work/mesa-25
+rm -f mb/src/vulkan/wsi/libvulkan_wsi.a.p/wsi_common_switch.c.o \
+      mb/src/vulkan/wsi/libvulkan_wsi.a \
+      mb/src/nouveau/vulkan/libnvk.a
+ninja -C mb src/vulkan/wsi/libvulkan_wsi.a src/nouveau/vulkan/libnvk.a \
+            src/vulkan/util/libvulkan_util.a
+bash package-nvk.sh
+```
+
+(A bare `ninja -C mb` fails on an unrelated test executable that links crt0 as a
+shared object; name the archive targets.)
+
+**Always verify the change actually landed** before testing on hardware — three
+separate "fixes" were tested on device without ever being compiled in:
+
+```sh
+aarch64-none-elf-objdump -d nvk-switch/lib/libvulkan.a | grep -c <a constant you added>
+```

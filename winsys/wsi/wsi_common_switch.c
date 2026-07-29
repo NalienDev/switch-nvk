@@ -30,6 +30,7 @@
 #include <vulkan/vulkan_vi.h>   /* VkViSurfaceCreateInfoNN (needs VK_USE_PLATFORM_VI_NN) */
 #include <switch.h>
 #include <stdio.h>              /* snprintf for the present-path profiler */
+#include <stdarg.h>             /* va_list for wsi_log                     */
 
 /* VkIcdSurfaceVi { VkIcdSurfaceBase base; void *window; } is defined by vk_icd.h.
  * .window holds the libnx NWindow* (cast on use). */
@@ -39,6 +40,60 @@
  * standalone smoke NROs (which don't link Dusklight) building/linking unchanged. */
 void dusk_switch_log(const char *msg);
 __attribute__((weak)) void dusk_switch_log(const char *msg) { (void)msg; }
+
+/* Diagnostic sink, set by the consumer.
+ *
+ * EVERYTHING this file reported used to be discarded on device. dusk_switch_log
+ * is only ever the weak no-op above (skate3 never defines it), and the printf()s
+ * land in a stdout that produced 74 bytes across a whole run. So the entire
+ * WSI/present layer — the layer the remaining failure is believed to live in —
+ * has never once reported anything from hardware.
+ *
+ * A function pointer the consumer assigns is the mechanism already PROVEN to
+ * work here (drm_shim's g_drm_shim_err_sink -> REX_BOOTLOG, which opens/flushes/
+ * closes per call and therefore survives an abrupt death). Use the same one
+ * rather than depending on stdout or on weak-symbol override. */
+void (*g_wsi_switch_log_sink)(const char *) = NULL;
+
+/* Report at most `n` times per call site. These fire from the per-frame present
+ * and acquire paths, and the sink writes to the SD card, so an error that
+ * repeats every frame must not become a write every frame. */
+#define WSI_LOG_FIRST(n, ...)                       \
+   do {                                             \
+      static unsigned _wsi_seen = 0;                \
+      if (_wsi_seen < (unsigned)(n)) {              \
+         _wsi_seen++;                               \
+         wsi_log(__VA_ARGS__);                      \
+      }                                             \
+   } while (0)
+
+/* Zero-copy scanout on/off, set by the consumer from a cvar before it creates a
+ * swapchain. Default on (that is the fast path).
+ *
+ * This exists as a BISECT. Registering our own block-linear images with the VI
+ * compositor -- a hand-built NvGraphicBuffer carrying a fabricated pid, magic,
+ * usage 0xb00 and kind 0xfe -- is the only place this port reaches deep into the
+ * compositor; everything else stays inside the process. A whole-console wedge
+ * cannot be diagnosed after the fact (when the console goes, the fs service goes
+ * with it, so nothing can be written), so the only way to test that surface is
+ * to switch it off and compare. Off falls back to libnx framebufferBegin/End,
+ * which replaces the entire VI interaction. */
+int g_wsi_switch_allow_zero_copy = 1;
+
+static void wsi_log(const char *fmt, ...)
+{
+   char buf[256];
+   va_list ap;
+   va_start(ap, fmt);
+   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+   va_end(ap);
+   if (n <= 0)
+      return;
+   if (g_wsi_switch_log_sink)
+      g_wsi_switch_log_sink(buf);
+   else
+      dusk_switch_log(buf);
+}
 
 /* ---- A1 zero-copy present (block-linear, kind=0xfe) ------------------------
  * Helpers from the winsys (drm_shim.c) and the NVK driver (nvk_image.c). The
@@ -98,10 +153,9 @@ wsi_switch_build_graphic_buffer(NvGraphicBuffer *gb, VkImage image,
    gb->planes[0].block_height_log2 = block_height_log2;
    gb->planes[0].scan              = NvDisplayScanFormat_Progressive;
    gb->planes[0].size              = nil_size_B;
-   printf("[wsi-zc] gb: nvmap=%u stride_px=%u pitch_B=%u bh_log2=%u size=%llu pte_kind=%u gpu_va=0x%llx\n",
-          nvmap_id, gb->stride, row_stride_B, block_height_log2,
-          (unsigned long long)nil_size_B, pte_kind, (unsigned long long)gpu_va);
-   fflush(stdout);
+   wsi_log("[wsi] gb: nvmap=%u stride_px=%u pitch_B=%u bh_log2=%u size=%llu pte_kind=%u gpu_va=0x%llx\n",
+           nvmap_id, gb->stride, row_stride_B, block_height_log2,
+           (unsigned long long)nil_size_B, pte_kind, (unsigned long long)gpu_va);
    return true;
 }
 
@@ -288,10 +342,55 @@ struct wsi_switch_swapchain {
    VkExtent2D extent;
    VkFormat vk_format;
    uint32_t next;           /* round-robin acquire index (fallback path)              */
+   int32_t dequeued;        /* slot currently dequeued from the nwindow, or -1        */
    struct wsi_switch_image images[WSI_SWITCH_MAX_IMAGES];
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_switch_swapchain, base.base, VkSwapchainKHR,
                                VK_OBJECT_TYPE_SWAPCHAIN_KHR)
+
+/* ---- window ownership ------------------------------------------------------
+ * There is exactly ONE default NWindow, and libnx models it as a single
+ * producer owning the whole window, not a set of independent swapchains:
+ *   - `slots_configured` is a per-WINDOW bitmask. nwindowConfigureBuffer on an
+ *     already-configured slot fails with 0xf59.
+ *   - only ONE buffer may be dequeued at a time; nwindowDequeueBuffer errors
+ *     0x2b59 while `cur_slot >= 0`.
+ *   - nwindowReleaseBuffers cancels the outstanding buffer, bqDisconnects and
+ *     zeroes `slots_configured` — for the WINDOW, whoever calls it.
+ * (All four verified by disassembling libnx.a's native_window.o.)
+ *
+ * Vulkan's oldSwapchain contract makes two of these swapchains exist at once:
+ * the consumer creates the new one and only then destroys the old (see
+ * VulkanPresenter::PaintAndPresentImpl). Without an explicit owner that
+ * sequence broke in two stages: every nwindowConfigureBuffer on the new chain
+ * failed 0xf59 so zero-copy silently dropped to the CPU-copy fallback, and then
+ * the OLD chain's destroy called nwindowReleaseBuffers and pulled the window out
+ * from under the NEW chain — after which framebufferBegin returns NULL and the
+ * present path wrote through it.
+ *
+ * So: exactly one swapchain owns the window, and only the owner may release it. */
+static struct wsi_switch_swapchain *g_nwindow_owner = NULL;
+
+static void
+wsi_switch_release_window(struct wsi_switch_swapchain *chain)
+{
+   if (g_nwindow_owner != chain)
+      return;
+   if (chain->dequeued >= 0) {
+      nwindowCancelBuffer(chain->window, chain->dequeued, NULL);
+      chain->dequeued = -1;
+   }
+   if (chain->fb_created) {
+      framebufferClose(&chain->fb);   /* releases the window's buffers itself */
+      chain->fb_created = false;
+   } else {
+      nwindowReleaseBuffers(chain->window);
+   }
+   for (uint32_t i = 0; i < chain->base.image_count; i++)
+      chain->images[i].configured = false;
+   chain->zero_copy = false;
+   g_nwindow_owner = NULL;
+}
 
 static struct wsi_image *
 wsi_switch_swapchain_get_wsi_image(struct wsi_swapchain *wsi_chain, uint32_t image_index)
@@ -316,7 +415,7 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
       s32 slot = -1;
       NvMultiFence mf;
       memset(&mf, 0, sizeof(mf));
-      if (trace) { printf("[wsi-zc] acquire: dequeue...\n"); fflush(stdout); }
+      if (trace) wsi_log("[wsi] acquire: dequeue...\n");
 
       /* Report honestly and return; do NOT retry in here.
        *
@@ -331,18 +430,44 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
        * timeout -- and neither may be read as "the swapchain is stale", which is
        * what led to it being torn down under the compositor.
        */
-      Result rc = nwindowDequeueBuffer(chain->window, &slot, &mf);
-      if (R_FAILED(rc))
+      /* libnx permits ONE outstanding dequeue per window; a second one fails
+       * 0x2b59. Vulkan lets the consumer hold several acquired images, so answer
+       * "none available right now" ourselves rather than letting libnx error —
+       * and, more importantly, never enter nwindowDequeueBuffer a second time:
+       * it waits on the buffer-release event with a UINT64_MAX timeout, so a
+       * doomed dequeue would park the caller in the driver forever instead of
+       * returning to the consumer's own bounded retry loop. */
+      if (chain->dequeued >= 0)
          return (info && info->timeout == 0) ? VK_NOT_READY : VK_TIMEOUT;
-      if (trace) { printf("[wsi-zc] acquire: dequeue -> 0x%x slot=%d\n", (unsigned)rc, slot); fflush(stdout); }
+
+      Result rc = nwindowDequeueBuffer(chain->window, &slot, &mf);
+      if (R_FAILED(rc)) {
+         /* NOT the transient "no buffer yet" case. nwindowDequeueBuffer loops
+          * internally on WouldBlock (it waits on the buffer-release event), so
+          * anything it actually RETURNS is structural — in practice the
+          * BufferQueue connection going away while a library applet (the
+          * software keyboard, shown for the team name) held the display.
+          *
+          * This used to report VK_TIMEOUT, which the consumer reads as "skip
+          * this frame and try again". It retried forever, the connection was
+          * never rebuilt, and the compositor sat waiting on a producer that had
+          * silently stopped producing — the whole-console wedge. OUT_OF_DATE
+          * makes the consumer recreate the swapchain, and nwindowConfigureBuffer
+          * reconnects (bqConnect) on the way back up, which is the recovery. */
+         WSI_LOG_FIRST(8, "[wsi] acquire: dequeue FAILED rc=0x%x -> OUT_OF_DATE\n",
+                       (unsigned)rc);
+         return VK_ERROR_OUT_OF_DATE_KHR;
+      }
+      if (trace) wsi_log("[wsi] acquire: dequeue -> 0x%x slot=%d\n", (unsigned)rc, slot);
       if (slot < 0 || (uint32_t)slot >= chain->base.image_count) {
          nwindowCancelBuffer(chain->window, slot, NULL);
          return VK_ERROR_OUT_OF_DATE_KHR;
       }
       nvMultiFenceWait(&mf, 1000000 /* 1s */);
-      if (trace) { printf("[wsi-zc] acquire: fence waited, slot=%d ready\n", slot); fflush(stdout); }
+      if (trace) wsi_log("[wsi] acquire: fence waited, slot=%d ready\n", slot);
       chain->images[slot].acquire_fence = mf;
       chain->images[slot].busy = true;
+      chain->dequeued = slot;
       *image_index = (uint32_t)slot;
       return VK_SUCCESS;
    }
@@ -387,7 +512,25 @@ wsi_switch_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
                             &chain->base.fences[image_index], VK_TRUE, ~0ull);
       t_fence = armGetSystemTick();             /* GPU render done                     */
       t_flush = t_fence;                        /* no dcache flush / no copy            */
-      nwindowQueueBuffer(chain->window, (s32)image_index, NULL);
+      Result qrc = nwindowQueueBuffer(chain->window, (s32)image_index, NULL);
+      if (R_FAILED(qrc)) {
+         /* This Result was discarded. A rejected queue therefore looked exactly
+          * like a successful present: the port went on believing it was
+          * displaying frames while the compositor received none, which is how a
+          * dead BufferQueue turned into a silent whole-console wedge instead of
+          * an error anyone could see. libnx's own framebuffer wrapper treats the
+          * same failure as fatal (diagAbortWithResult) — recovering is better.
+          * The slot is still ours on failure (libnx only clears cur_slot on
+          * success), so hand it back before asking for a new swapchain. */
+         WSI_LOG_FIRST(8, "[wsi] present: queue FAILED rc=0x%x slot=%u -> OUT_OF_DATE\n",
+                       (unsigned)qrc, image_index);
+         nwindowCancelBuffer(chain->window, (s32)image_index, NULL);
+         chain->dequeued = -1;
+         img->busy = false;
+         return VK_ERROR_OUT_OF_DATE_KHR;
+      }
+      if (chain->dequeued == (int32_t)image_index)
+         chain->dequeued = -1;                  /* handed back to the compositor        */
       t_copy = armGetSystemTick();              /* nwindowQueueBuffer (VI queue) done   */
    }
    /* CPU-copy fallback: the rendered (host-visible) image -> the next libnx
@@ -410,12 +553,35 @@ wsi_switch_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
       t_flush = armGetSystemTick();            /* dcache flush of the whole image done */
       u32 dst_stride = 0;
       u8 *dst = (u8 *)framebufferBegin(&chain->fb, &dst_stride);
+      /* Defensive only, and narrower than it looks: libnx's framebufferBegin
+       * returns NULL ONLY when the Framebuffer was never initialised (or was
+       * closed). It does NOT return NULL when the dequeue fails — disassembly
+       * shows it calls diagAbortWithResult(0x2b59 BadGfxDequeueBuffer) and kills
+       * the process, which is exactly how this path dies today. So this check
+       * cannot rescue a dead BufferQueue; only the zero-copy path above can
+       * recover, because it owns its own dequeue/queue calls. Keep the check for
+       * the closed-framebuffer case, but do not mistake it for protection. */
+      if (dst == NULL) {
+         img->busy = false;
+         return VK_ERROR_OUT_OF_DATE_KHR;
+      }
       const u8 *src = (const u8 *)img->base.cpu_map;
       u32 row_B = MIN2(dst_stride, src_stride);
       for (u32 y = 0; y < chain->extent.height; y++)
          memcpy(dst + (size_t)y * dst_stride, src + (size_t)y * src_stride, row_B);
       framebufferEnd(&chain->fb);
       t_copy = armGetSystemTick();             /* memcpy + framebufferEnd (VI queue) done */
+   }
+   /* Neither path could present (zero-copy lost its registration, or the CPU
+    * fallback has no cpu_map). Returning VK_SUCCESS here would strand the slot
+    * as dequeued forever and every later acquire would report VK_TIMEOUT. */
+   else {
+      if (chain->dequeued == (int32_t)image_index) {
+         nwindowCancelBuffer(chain->window, chain->dequeued, NULL);
+         chain->dequeued = -1;
+      }
+      img->busy = false;
+      return VK_ERROR_OUT_OF_DATE_KHR;
    }
 
    /* Accumulate per-phase ns; emit one averaged line every 60 presents (batched so
@@ -444,7 +610,7 @@ wsi_switch_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
             (unsigned long long)(acc_total / nframes / 1000),
             nintervals ? (unsigned long long)(acc_interval / nintervals / 1000) : 0ull,
             fps);
-         dusk_switch_log(buf);
+         wsi_log("%s", buf);
          acc_fence = acc_flush = acc_copy = acc_total = acc_interval = 0;
          nframes = nintervals = 0;
       }
@@ -459,8 +625,15 @@ wsi_switch_swapchain_release_images(struct wsi_swapchain *wsi_chain,
                                     uint32_t count, const uint32_t *indices)
 {
    struct wsi_switch_swapchain *chain = (struct wsi_switch_swapchain *)wsi_chain;
-   for (uint32_t i = 0; i < count; i++)
+   for (uint32_t i = 0; i < count; i++) {
       chain->images[indices[i]].busy = false;
+      /* An image released without being presented still holds the window's one
+       * dequeue slot; give it back or no further acquire can ever succeed. */
+      if (chain->dequeued == (int32_t)indices[i]) {
+         nwindowCancelBuffer(chain->window, chain->dequeued, NULL);
+         chain->dequeued = -1;
+      }
+   }
    return VK_SUCCESS;
 }
 
@@ -469,10 +642,10 @@ wsi_switch_swapchain_destroy(struct wsi_swapchain *wsi_chain,
                              const VkAllocationCallbacks *pAllocator)
 {
    struct wsi_switch_swapchain *chain = (struct wsi_switch_swapchain *)wsi_chain;
-   if (chain->zero_copy)
-      nwindowReleaseBuffers(chain->window);
-   if (chain->fb_created)
-      framebufferClose(&chain->fb);
+   /* Only if we still own the window. A retired swapchain is destroyed AFTER its
+    * replacement was created (oldSwapchain), so releasing unconditionally here
+    * tore down the live chain's buffers. */
+   wsi_switch_release_window(chain);
    for (uint32_t i = 0; i < chain->base.image_count; i++) {
       if (chain->images[i].base.image != VK_NULL_HANDLE)
          wsi_destroy_image(&chain->base, &chain->images[i].base);
@@ -527,6 +700,7 @@ wsi_switch_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->window = (NWindow *)surface->window;
    chain->extent = pCreateInfo->imageExtent;
    chain->vk_format = pCreateInfo->imageFormat;
+   chain->dequeued = -1;    /* vk_zalloc gives 0, which would mean "slot 0 held" */
 
    for (uint32_t i = 0; i < num_images; i++) {
       result = wsi_create_image(&chain->base, &chain->base.image_info,
@@ -541,26 +715,43 @@ wsi_switch_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     * layout, then nwindowConfigureBuffer). slot == image index (identity). If any
     * image can't be wrapped, fall back to the libnx-framebuffer CPU-copy path. */
    nvFenceInit();   /* required before nwindowDequeueBuffer / nvMultiFenceWait */
+
+   /* Take the window. If a retired swapchain still holds it (the oldSwapchain of
+    * this very call), release it NOW: the consumer has already awaited every
+    * submission that used it before retiring it, so its buffers are idle. Doing
+    * it here rather than in the old chain's destroy is what keeps every
+    * nwindowConfigureBuffer below from failing 0xf59 ("slot already configured")
+    * and silently dropping zero-copy on every swapchain recreation. */
+   if (g_nwindow_owner != NULL && g_nwindow_owner != chain) {
+      wsi_log("[wsi] releasing window from retired swapchain %p\n",
+              (void *)g_nwindow_owner);
+      wsi_switch_release_window(g_nwindow_owner);
+   }
+   g_nwindow_owner = chain;
+
    nwindowSetDimensions(chain->window, chain->extent.width, chain->extent.height);
-   chain->zero_copy = true;
-   for (uint32_t i = 0; i < num_images; i++) {
+   chain->zero_copy = (g_wsi_switch_allow_zero_copy != 0);
+   if (!chain->zero_copy)
+      wsi_log("[wsi] zero-copy DISABLED by request -> CPU-copy fallback\n");
+   for (uint32_t i = 0; chain->zero_copy && i < num_images; i++) {
       if (!wsi_switch_build_graphic_buffer(&chain->images[i].gb,
                                            chain->images[i].base.image,
                                            chain->vk_format, chain->extent)) {
-         printf("[wsi-zc] img%u build_graphic_buffer FAILED\n", i); fflush(stdout);
+         wsi_log("[wsi] img%u build_graphic_buffer FAILED\n", i);
          chain->zero_copy = false; break;
       }
       Result rc = nwindowConfigureBuffer(chain->window, (s32)i, &chain->images[i].gb);
-      printf("[wsi-zc] img%u nwindowConfigureBuffer -> 0x%x\n", i, (unsigned)rc); fflush(stdout);
+      wsi_log("[wsi] img%u nwindowConfigureBuffer -> 0x%x\n", i, (unsigned)rc);
       if (R_FAILED(rc)) { chain->zero_copy = false; break; }
       chain->images[i].configured = true;
    }
 
    if (chain->zero_copy) {
-      printf("[wsi-zc] zero-copy ENABLED (block-linear scanout, kind=0xfe)\n"); fflush(stdout);
-      dusk_switch_log("[wsi] zero-copy ENABLED (block-linear nwindow scanout, kind=0xfe)\n");
+      wsi_log("[wsi] zero-copy ENABLED (block-linear nwindow scanout, kind=0xfe)\n");
    } else {
-      printf("[wsi-zc] zero-copy FAILED -> CPU-copy fallback\n"); fflush(stdout);
+      /* Only a real failure; the deliberate case already said so above. */
+      if (g_wsi_switch_allow_zero_copy)
+         wsi_log("[wsi] zero-copy FAILED -> CPU-copy fallback\n");
       /* Fallback: reset the nwindow, then libnx framebuffer + CPU-copy present. */
       for (uint32_t i = 0; i < num_images; i++) chain->images[i].configured = false;
       nwindowReleaseBuffers(chain->window);
@@ -572,7 +763,6 @@ wsi_switch_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       if (R_FAILED(rc)) { result = VK_ERROR_INITIALIZATION_FAILED; goto fail; }
       framebufferMakeLinear(&chain->fb);
       chain->fb_created = true;
-      dusk_switch_log("[wsi] zero-copy FAILED -> CPU-copy fallback\n");
    }
 
    *swapchain_out = &chain->base;

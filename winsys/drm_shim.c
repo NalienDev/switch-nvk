@@ -768,10 +768,23 @@ static uint32_t gen_setobj_cmdlist(uint32_t *buf)
  * init submit (same code, succeeds or fails between runs). Retry with a short
  * backoff so submission is deterministic. (TODO: the g_dev.lock is held across
  * the sleep; fine for the single-threaded smoke test, revisit for concurrency.) */
+/* Attempts per kickoff. DO NOT RAISE THIS.
+ *
+ * It was 400, assuming 0xd5c is a transient "ring full" that clears if you wait.
+ * Hardware says otherwise: across consecutive failures the GPU syncpoint advanced
+ * by EXACTLY the retry count per failed submit --
+ *   hw delta +1 -> +401 -> +801 -> +1201   with 400 retries
+ *   hw delta +1 -> +3   -> +5   -> +7      with 2
+ * So nvGpuChannelKickoff is NOT failing to submit: the GPU executes the queued
+ * work and advances the syncpoint, and the ioctl returns 0xd5c anyway. Every
+ * retry RE-EXECUTES the same command buffers. Retrying recovers nothing here; it
+ * only multiplies duplicated GPU work. */
+#define SHIM_KICKOFF_ATTEMPTS 2
+
 static Result kickoff_retry(NvGpuChannel *chan)
 {
    Result rc = 0;
-   for (int i = 0; i < 400; i++) {
+   for (int i = 0; i < SHIM_KICKOFF_ATTEMPTS; i++) {
       rc = nvGpuChannelKickoff(chan);
       if (R_SUCCEEDED(rc) || rc != 0xd5c)
          return rc;
@@ -842,6 +855,56 @@ static Result kickoff_retry(NvGpuChannel *chan)
                         (unsigned long long)(bo_bytes / 1024),
                         (unsigned long long)(bo_mapped_bytes / 1024),
                         chan_used, (unsigned)SHIM_MAX_CHANNELS);
+
+         /* Is GPU memory ACTUALLY exhausted right now, or is 0xd5c about the
+          * kernel's per-submit job state?
+          *
+          * The earlier "BO/nvmap exhaustion is ruled out" conclusion rested on
+          * the COUNT (91 of 4096) -- but 4096 is this shim's own table size, not
+          * a kernel limit, so it says nothing about BYTES. At the failure we hold
+          * ~303 MiB of nvmap objects, and the failure state has now reproduced
+          * byte-identically across different builds and sessions
+          * (BOs=91/4096 310404KiB), which a merely load-dependent fault should
+          * not do.
+          *
+          * So: try a fresh, modest allocation at the exact moment of failure.
+          *   both succeed  -> nvmap and GPU VA are still available, the ceiling
+          *                    is NOT total GPU memory, and the per-submit job
+          *                    pool lead stands.
+          *   nvMapCreate fails -> a byte ceiling is real and the count-based
+          *                    exoneration does not cover it.
+          *   memalign fails -> host newlib heap, a different problem entirely
+          *                    (and one this port has hit before).
+          *
+          * Deliberately small and fully released, so the probe cannot itself be
+          * what pushes anything over an edge. */
+         {
+            const uint64_t probe_size = 4 * 1024 * 1024;
+            void *probe_mem = memalign(0x1000, probe_size);
+            if (!probe_mem) {
+               SHIM_ERR_FIRST(2, "drm_shim: 0xd5c probe: host memalign FAILED "
+                                 "(%lluKiB) -> newlib heap exhausted\n",
+                              (unsigned long long)(probe_size / 1024));
+            } else {
+               NvMap probe_map;
+               iova_t probe_va = 0;
+               Result prc = nvMapCreate(&probe_map, probe_mem, probe_size,
+                                        0x1000, NvKind_Pitch, false);
+               Result mrc = 0xFFFFFFFF;   /* "not attempted" */
+               if (R_SUCCEEDED(prc)) {
+                  mrc = nvAddressSpaceMap(&g_dev.addr_space,
+                                          nvMapGetHandle(&probe_map),
+                                          true, NvKind_Pitch, &probe_va);
+                  if (R_SUCCEEDED(mrc))
+                     nvAddressSpaceUnmap(&g_dev.addr_space, probe_va);
+                  nvMapClose(&probe_map);
+               }
+               free(probe_mem);
+               SHIM_ERR_FIRST(2, "drm_shim: 0xd5c probe: %lluKiB nvMapCreate=0x%x "
+                                 "nvAddressSpaceMap=0x%x\n",
+                              (unsigned long long)(probe_size / 1024), prc, mrc);
+            }
+         }
       }
    }
    return rc;
@@ -1178,7 +1241,44 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
        * starts that chain has to be able to see this. */
       SHIM_ERR_FIRST(8, "drm_shim: EXEC KICKOFF FAILED rc=0x%x chan=%u push_count=%u\n",
                rc, (unsigned)req->channel, req->push_count);
-      return -EIO;
+
+      /* RESET THE CHANNEL, THEN DROP THE SUBMIT.
+       *
+       * Returning -EIO makes NVK fail the vkQueueSubmit, which the consumer turns
+       * into abort() -- so ONE refused submit ends the run. 0xd5c is intermittent,
+       * which is the whole reason "how far it gets" varies between identical
+       * builds. Measured: this path aborts on failure #1, whereas resetting and
+       * continuing survived 8 failures in a run.
+       *
+       * A failed kickoff does NOT clear what was appended, and that turns one
+       * refusal into a permanently poisoned channel:
+       *   entries=2 incr=1 -> 4/2 -> 6/3 -> 8/4   (accumulating)
+       * `entries` climbs because libnx leaves num_entries alone on ioctl failure,
+       * so the next nouveau_exec appends on top of the dead submit; fence_incr
+       * stacks the same way and chan->fence.value freezes. Dropping work is only
+       * safe once that state is cleared -- which is why these belong together and
+       * were measured together.
+       *
+       * engines_bound is re-armed because the SET_OBJECT binds ride on the first
+       * submit; discarding it without re-emitting them would leave NVK methods
+       * hitting an unbound subchannel -> MMU fault -> dead channel.
+       *
+       * The signalled syncobjs MUST be complete-with-NO-fence: attaching the
+       * channel fence would point them at a syncpoint value the GPU never reaches
+       * (this work was never submitted) and anything waiting would hang forever --
+       * worse than the abort being replaced. */
+      ch->chan.num_entries = 0;
+      ch->chan.fence_incr = 0;
+      ch->engines_bound = false;
+      for (uint32_t i = 0; i < req->sig_count; i++) {
+         struct shim_syncobj *s = syncobj_lookup(sigs[i].handle);
+         if (s) {
+            s->has_fence = false;
+            s->signaled = true;
+            s->value = sigs[i].timeline_value;
+         }
+      }
+      return 0;
    }
 
    /* The real completion fence: kickoff advanced c->fence by the increment. */

@@ -463,7 +463,64 @@ wsi_switch_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
          nwindowCancelBuffer(chain->window, slot, NULL);
          return VK_ERROR_OUT_OF_DATE_KHR;
       }
-      nvMultiFenceWait(&mf, 1000000 /* 1s */);
+      /* The producer fence says when the COMPOSITOR has finished reading this
+       * slot (see the dequeue contract above). Its Result was discarded here.
+       *
+       * That is not cosmetic: on failure this returned VK_SUCCESS anyway and
+       * handed the app a slot VI may still be scanning out. The app then renders
+       * into a buffer that is live on screen -- which is what the black flashing
+       * bands look like, and they appear ONLY with zero-copy enabled. The
+       * CPU-copy fallback is immune because libnx's framebufferBegin/End owns
+       * slot lifetime itself; measured 2026-07-30, bands in mode A and none in
+       * mode B across runs with an identical 16 GuestTryCopy refusals, which is
+       * what ruled the copy paths out.
+       *
+       * Cancel instead of handing it out, mirroring the invalid-slot path above:
+       * OUT_OF_DATE makes the consumer rebuild, and nwindowConfigureBuffer
+       * reconnects on the way back up. Cancelling also keeps libnx's
+       * one-outstanding-dequeue rule satisfied -- chain->dequeued is only set
+       * below, on the success path.
+       *
+       * The log line is the experiment: if it never appears, this was NOT the
+       * band mechanism and the theory is dead in one run. Capped by
+       * WSI_LOG_FIRST because this is a per-frame path on an SD-card sink. */
+      /* HOW MANY sub-fences did the compositor actually give us?
+       *
+       * nvMultiFenceWait iterates mf.num_fences entries; with num_fences == 0 it
+       * waits on NOTHING and returns success. That would look identical to a
+       * healthy wait from the check below -- which is why that check firing zero
+       * times did NOT prove the slot was safe to render into.
+       *
+       * This matters because the symptom is a single vertical band that appears
+       * and vanishes instantly, recurring every 1-2 s, ONLY in zero-copy. That is
+       * transient corruption of one region, i.e. what rendering into a buffer the
+       * compositor is still reading looks like -- not a static layout fault
+       * (persistent) and not tearing (horizontal, since scanout is row-major).
+       *
+       * Read: zero_fences staying at 0 => the fence path is real and this theory
+       * is dead. zero_fences climbing with the acquire count => the acquire is
+       * relying on the BufferQueue alone, with no GPU-side guarantee that the
+       * compositor finished reading, and the fix is to establish one. */
+      {
+         static uint64_t acq_total = 0, acq_zero_fences = 0;
+         acq_total++;
+         if (mf.num_fences == 0)
+            acq_zero_fences++;
+         WSI_LOG_FIRST(6, "[wsi] acquire: slot=%d mf.num_fences=%u\n",
+                       slot, (unsigned)mf.num_fences);
+         if ((acq_total % 300) == 0)
+            wsi_log("[wsi] acquire census: %llu acquires, %llu with ZERO fences\n",
+                    (unsigned long long)acq_total,
+                    (unsigned long long)acq_zero_fences);
+      }
+
+      Result fwrc = nvMultiFenceWait(&mf, 1000000 /* 1s */);
+      if (R_FAILED(fwrc)) {
+         WSI_LOG_FIRST(8, "[wsi] acquire: producer fence wait FAILED rc=0x%x "
+                          "slot=%d -> OUT_OF_DATE\n", (unsigned)fwrc, slot);
+         nwindowCancelBuffer(chain->window, slot, NULL);
+         return VK_ERROR_OUT_OF_DATE_KHR;
+      }
       if (trace) wsi_log("[wsi] acquire: fence waited, slot=%d ready\n", slot);
       chain->images[slot].acquire_fence = mf;
       chain->images[slot].busy = true;

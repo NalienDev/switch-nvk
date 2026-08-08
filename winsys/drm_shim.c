@@ -1415,11 +1415,36 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
     * succeeded. There is nothing to execute; just signal any sig syncs with the
     * channel's current fence (the last submitted work) and return. */
    if (req->push_count == 0) {
-      /* Flush first, so "the channel's current fence" really does cover all the
-       * work submitted so far. With a batch pending it would otherwise name the
-       * last KICKED-OFF submit and signal these syncobjs complete while the
-       * EXECs before them were still sitting unsubmitted in the ring. */
-      channel_flush_locked(ch);
+      /* An empty EXEC means "everything submitted on this channel so far is
+       * complete". With a batch pending that is EXACTLY what the batch's own
+       * completion fence will mean, so these syncobjs can just join the batch
+       * and collect that fence when it is kicked off -- no flush needed.
+       *
+       * This used to flush, and it was a major cause of shallow batches: NVK
+       * issues fence-only submits regularly, and every one of them ended the
+       * batch. Hardware measured batched=1..2 against a cap of 8, which left
+       * the submit rate high enough that turning on sub-native rendering (43%
+       * of the pixels, so many more frames per second) brought 0xd5c straight
+       * back -- 8 failures a run, no main menu.
+       *
+       * With no batch pending there is nothing unsubmitted, so the channel's
+       * current fence already covers everything and the old flush call was a
+       * no-op on that path anyway. */
+      if (ch->batch_execs != 0 &&
+          ch->batch_sig_count + req->sig_count <= SHIM_MAX_BATCH_SIGS) {
+         for (uint32_t i = 0; i < req->sig_count; i++) {
+            struct shim_syncobj *s = syncobj_lookup(sigs[i].handle);
+            if (!s)
+               continue;
+            s->value        = sigs[i].timeline_value;
+            s->has_fence    = false;
+            s->signaled     = false;
+            s->pending      = true;
+            s->pending_chan = (uint32_t)req->channel;
+            ch->batch_sig[ch->batch_sig_count++] = sigs[i].handle;
+         }
+         return 0;
+      }
       NvFence f;
       nvGpuChannelGetFence(&ch->chan, &f);
       for (uint32_t i = 0; i < req->sig_count; i++) {

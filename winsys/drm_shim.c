@@ -91,8 +91,24 @@ int g_drm_shim_sync_submit = 0;
  * timing says nothing about where a guest frame goes. These answer the question
  * that matters: how many GPU submits does one guest frame cost, and how much of
  * that frame is spent blocked in the in-flight throttle waiting for the GPU. */
-uint64_t g_drm_shim_exec_count = 0;    /* EXEC ioctls that reached kickoff      */
+uint64_t g_drm_shim_exec_count = 0;    /* EXEC ioctls accepted                  */
 uint64_t g_drm_shim_exec_wait_ns = 0;  /* time blocked in the in-flight throttle */
+uint64_t g_drm_shim_kickoff_count = 0; /* actual nvGpuChannelKickoff calls       */
+
+/* How many EXECs may be coalesced into ONE kickoff. See channel_flush_locked.
+ *
+ * 0xd5c tracks how OFTEN we submit, not how much work or memory is involved --
+ * measured two ways on hardware. A probe allocates and maps a fresh 4 MiB nvmap
+ * object at the exact instant kickoff returns 0xd5c and both calls succeed, so
+ * there is no byte ceiling; and making frames CHEAPER (shadows/haze off) made
+ * 0xd5c MORE frequent, not less, while the BO bytes held at the failure fell.
+ * That is nvgpu's per-submit job pool being reaped lazily while we submit faster
+ * than it frees, and the only thing that helps is submitting less often.
+ *
+ * Set to 1 to get exactly the old one-kickoff-per-EXEC behaviour back -- the A/B
+ * control for this change, since every previous submit-path theory here was
+ * settled by a hardware A/B rather than by reasoning. */
+int g_drm_shim_batch_max = 8;
 static void shim_err(const char *fmt, ...)
 {
    char buf[192];
@@ -151,6 +167,20 @@ void drm_shim_dbg(const char *msg)
  * slot actually holds one. */
 #define SHIM_MAX_INFLIGHT 1
 
+/* Ceiling on EXECs coalesced into one kickoff (g_drm_shim_batch_max is clamped
+ * to this), and on the syncobjs one batch may promise to signal. */
+#define SHIM_MAX_BATCH_EXECS 32
+#define SHIM_MAX_BATCH_SIGS  128
+
+/* Stop appending and kick off once the GPFIFO ring reaches this many entries.
+ * NvGpuChannel::entries is a FIXED GPFIFO_QUEUE_SIZE (2048) array and
+ * nvGpuChannelAppendEntry FAILS when it is full -- it does not kick off for you.
+ * Batching is the first thing here that ever lets entries accumulate across
+ * EXECs, so it is also the first thing that could hit that wall. Half the ring
+ * is a wide margin: a failing submit has read entries=2/2048 every single time,
+ * i.e. ~2 entries per EXEC. */
+#define SHIM_BATCH_ENTRY_LIMIT (GPFIFO_QUEUE_SIZE / 2)
+
 /* GM20B (Tegra X1) — Maxwell 2nd gen. chipset 0x12b => NVK sm_for_chipset()=53.
  * The 3D engine class is what NVK actually gates on (>= KEPLER_A); we report
  * the real Maxwell-B class set from the synthetic NVIF SCLASS query below. */
@@ -178,6 +208,12 @@ struct shim_syncobj {
    uint64_t value;        /* timeline point (binary syncobjs ignore)           */
    bool     has_fence;    /* M2: a real GPU fence was attached by EXEC         */
    NvFence  fence;        /* libnx syncpoint fence to wait on                  */
+   /* Signalled by an EXEC whose kickoff is still DEFERRED in a batch. Neither
+    * signalled nor holding a fence: the work is not on the GPU yet, so there is
+    * nothing to wait on and reporting it complete would hand NVK a buffer the
+    * GPU has not been given. Every path that observes completion flushes first,
+    * which turns this into a real fence. */
+   bool     pending;
 };
 
 /* A real libnx GPFIFO channel + the builtin cmdbuf carrying the Maxwell
@@ -198,6 +234,14 @@ struct shim_channel {
    bool         inflight_valid[SHIM_MAX_INFLIGHT];
    uint32_t     inflight_head;
 
+   /* Deferred-kickoff batch: EXECs appended to the ring but not yet submitted.
+    * batch_sig holds every syncobj those EXECs promised to signal, because the
+    * completion fence for all of them only exists once the batch is kicked off
+    * -- and if the kickoff FAILS they all have to be released together, since
+    * the reset discards the whole ring, not just the last EXEC's entries. */
+   uint32_t     batch_execs;
+   uint32_t     batch_sig[SHIM_MAX_BATCH_SIGS];
+   uint32_t     batch_sig_count;
 };
 
 static struct shim_device {
@@ -227,6 +271,8 @@ static struct shim_syncobj *syncobj_lookup(uint32_t handle);
 /* Defined in the channel section; used by NVIF NEW to alloc engine obj-ctx. */
 struct shim_channel;
 static struct shim_channel *channel_lookup(uint32_t id);
+/* Defined with EXEC; channel teardown must submit a deferred batch first. */
+static int channel_flush_locked(struct shim_channel *ch);
 
 /* ------------------------------------------------------------------------- */
 /* libnx nv bring-up — mirrors libdrm_nouveau's nouveau_device_new ordering.   */
@@ -976,6 +1022,11 @@ static int nouveau_channel_free(struct drm_nouveau_channel_free *req)
    struct shim_channel *ch = channel_lookup((uint32_t)req->channel);
    if (!ch)
       return 0;
+   /* Submit anything still batched before the channel goes away: closing over a
+    * deferred batch would drop that work on the floor AND strand every syncobj
+    * it promised to signal in the `pending` state, with no channel left to
+    * resolve them. */
+   channel_flush_locked(ch);
    nvGpuChannelClose(&ch->chan);
    for (int bo = ch->cmdbuf_bo; bo == ch->cmdbuf_bo; ) { /* free cmdbuf */
       if (bo >= 0 && g_dev.bos[bo].used) {
@@ -1076,9 +1127,241 @@ static int nouveau_vm_bind(struct drm_nouveau_vm_bind *req)
    for (uint32_t i = 0; i < req->sig_count; i++) {
       struct shim_syncobj *s = syncobj_lookup(sigs[i].handle);
       /* empty EXEC: signal immediately (no GPU work) -> the timeline point is reached now. */
-      if (s) { s->signaled = true; s->has_fence = false; s->value = sigs[i].timeline_value; }
+      if (s) { s->signaled = true; s->has_fence = false; s->pending = false; s->value = sigs[i].timeline_value; }
    }
    return 0;
+}
+
+/* Clamp of g_drm_shim_batch_max; 1 == the old kickoff-per-EXEC behaviour. */
+static inline uint32_t shim_batch_max(void)
+{
+   int v = g_drm_shim_batch_max;
+   if (v < 1) v = 1;
+   if (v > SHIM_MAX_BATCH_EXECS) v = SHIM_MAX_BATCH_EXECS;
+   return (uint32_t)v;
+}
+
+/* Submit everything appended to `ch` since the last flush, as ONE kickoff.
+ *
+ * This is now the only place nvGpuChannelKickoff is reached from the EXEC path,
+ * and it carries the complete submit protocol that nouveau_exec used to run
+ * inline: one syncpoint increment, the fence cmdlist that performs it on the
+ * GPU, the depth-1 in-flight throttle, the bounded retry, and the channel reset
+ * on failure. None of that is changed. Four throttle shapes were measured on
+ * hardware and exactly one is stable; batching deliberately does not touch the
+ * shape, it only lets several EXECs' pushbuf entries ride in the same kickoff.
+ *
+ * ONE increment per KICKOFF, not per EXEC. Every syncobj signalled by any EXEC
+ * in the batch gets the batch's single completion fence. That makes a fence
+ * report completion no EARLIER than its own EXEC finished, and possibly later --
+ * conservative in the only direction that matters, because early is corruption
+ * and late is just latency. Predicting a separate fence value per EXEC would
+ * instead mean relying on libnx kicking off with fence_incr > 1 and the kernel
+ * applying every one of those increments, which has never been validated here;
+ * this keeps the accounting at the single-increment case that is known to work.
+ *
+ * Caller holds g_dev.lock. */
+static int channel_flush_locked(struct shim_channel *ch)
+{
+   if (ch->batch_execs == 0)
+      return 0;                  /* nothing appended since the last kickoff */
+
+   const unsigned chan_id = (unsigned)(ch - g_dev.channels) + 1;
+   const uint32_t batched = ch->batch_execs;
+
+   /* STANDARD libnx fence path (matches deko3d + libdrm_nouveau, which use this
+    * and work): request ONE syncpoint increment via IncrFence (sets KickoffPb
+    * BIT(8); the kernel adds the increment), plus the BUILTIN FENCE CMDLIST --
+    * the actual Maxwell command that INCREMENTS the syncpt on the GPU
+    * (gen_fence_cmdlist: method 0x0B2 with syncpt_id|incr-bit). IncrFence alone
+    * only bumps libnx's expected counter; WITHOUT this entry the GPU never
+    * increments the syncpt, so the completion fence is never reached. Exactly
+    * what libdrm_nouveau/pushbuf.c:226-228 does. */
+   nvGpuChannelIncrFence(&ch->chan);
+   nvGpuChannelAppendEntry(&ch->chan, ch->cmdbuf_va, ch->fence_num_cmds,
+                           GPFIFO_ENTRY_NOT_MAIN | GPFIFO_ENTRY_NO_PREFETCH, 0);
+
+   /* Bound outstanding work before kicking off.
+    *
+    * MEASURED TRADE-OFF, both on hardware:
+    *   with this wait: 3.7 fps, STABLE,  submit-wait 206 ms/frame (78% of frame)
+    *   without it:     3.0 fps, CRASHES 0xd5c, submit-wait 0 ms/frame
+    * Removing it does eliminate the wait, but the kernel then refuses a submit
+    * outright and kickoff_retry's on-demand back-off cannot recover.
+    *
+    * The wait is now paid once per BATCH rather than once per EXEC, which is the
+    * whole point: a single nvFenceWait costs ~3-20 ms depending on how much real
+    * GPU work it covers, and at 7-11 EXECs per guest frame that was being paid
+    * 7-11 times a frame. Same throttle, same depth, fewer payments. */
+   {
+      const uint32_t slot = ch->inflight_head;
+      if (ch->inflight_valid[slot]) {
+         NvFence oldest = ch->inflight[slot];
+         const u64 t_wait0 = armGetSystemTick();
+         Result tr = nvFenceWait(&oldest, 2000000LL);   /* us => 2 s */
+         g_drm_shim_exec_wait_ns += armTicksToNs(armGetSystemTick() - t_wait0);
+         if (R_FAILED(tr)) {
+            SHIM_ERR_FIRST(4, "drm_shim: inflight throttle TIMEOUT chan=%u fence=%u/%u rc=0x%x\n",
+                           chan_id, oldest.id, oldest.value, tr);
+         }
+         ch->inflight_valid[slot] = false;
+      }
+   }
+
+   g_drm_shim_kickoff_count++;
+   Result rc = kickoff_retry(&ch->chan);
+   SHIM_LOG("EXEC kickoff returned rc=0x%x (chan=%u batched=%u entries=%u)\n",
+            rc, chan_id, batched, (unsigned)ch->chan.num_entries);
+   if (R_FAILED(rc)) {
+      /* This was the one submit-path failure with NO release-build trace at all:
+       * SHIM_LOG compiles out, so a kickoff that failed its retries returned
+       * -EIO in complete silence. NVK turns that into a failed vkQueueSubmit,
+       * and the consumer responds by recreating the swapchain. Any hunt for what
+       * starts that chain has to be able to see this. */
+      SHIM_ERR_FIRST(8, "drm_shim: EXEC KICKOFF FAILED rc=0x%x chan=%u batched=%u\n",
+                     rc, chan_id, batched);
+
+      /* RESET THE CHANNEL, THEN DROP THE SUBMIT.
+       *
+       * Returning -EIO makes NVK fail the vkQueueSubmit, which the consumer turns
+       * into abort() -- so ONE refused submit ends the run. 0xd5c is intermittent,
+       * which is the whole reason "how far it gets" varies between identical
+       * builds. Measured: that path aborts on failure #1, whereas resetting and
+       * continuing survived 8 failures in a run.
+       *
+       * A failed kickoff does NOT clear what was appended, and that turns one
+       * refusal into a permanently poisoned channel:
+       *   entries=2 incr=1 -> 4/2 -> 6/3 -> 8/4   (accumulating)
+       * `entries` climbs because libnx leaves num_entries alone on ioctl failure,
+       * so the next append lands on top of the dead submit; fence_incr stacks the
+       * same way and chan->fence.value freezes. Dropping work is only safe once
+       * that state is cleared -- which is why these belong together and were
+       * measured together.
+       *
+       * engines_bound is re-armed because the SET_OBJECT binds ride on the first
+       * submit; discarding it without re-emitting them would leave NVK methods
+       * hitting an unbound subchannel -> MMU fault -> dead channel.
+       *
+       * The signalled syncobjs MUST be complete-with-NO-fence: attaching the
+       * channel fence would point them at a syncpoint value the GPU never reaches
+       * (this work was never submitted) and anything waiting would hang forever --
+       * worse than the abort being replaced. This releases the syncobjs of EVERY
+       * EXEC in the batch, because the reset discards all of their entries, not
+       * just the last one's. */
+      ch->chan.num_entries = 0;
+      ch->chan.fence_incr = 0;
+      ch->engines_bound = false;
+      for (uint32_t i = 0; i < ch->batch_sig_count; i++) {
+         struct shim_syncobj *s = syncobj_lookup(ch->batch_sig[i]);
+         if (s) { s->has_fence = false; s->signaled = true; s->pending = false; }
+      }
+      ch->batch_sig_count = 0;
+      ch->batch_execs = 0;
+      return 0;
+   }
+
+   /* The real completion fence: kickoff advanced c->fence by the increment. */
+   NvFence fence;
+   nvGpuChannelGetFence(&ch->chan, &fence);
+
+   ch->inflight[ch->inflight_head] = fence;
+   ch->inflight_valid[ch->inflight_head] = true;
+   ch->inflight_head = (ch->inflight_head + 1) % SHIM_MAX_INFLIGHT;
+
+   for (uint32_t i = 0; i < ch->batch_sig_count; i++) {
+      struct shim_syncobj *s = syncobj_lookup(ch->batch_sig[i]);
+      if (s) { s->fence = fence; s->has_fence = true; s->signaled = true; s->pending = false; }
+   }
+   ch->batch_sig_count = 0;
+   ch->batch_execs = 0;
+
+   /* Optional synchronous drain -- OFF by default.
+    *
+    * This used to block on EVERY submit until the GPU had fully finished it,
+    * which means the CPU and GPU never overlapped: no pipelining, no queueing,
+    * one submit at a time. It was a bring-up crutch. The correctness it provided
+    * is not lost: NVK still gets a real fence on every signalled syncobj
+    * (attached above), so anything that actually needs completion waits on it.
+    *
+    * Set to 1 to restore the old lock-step behaviour when debugging a suspected
+    * GPU execution fault. */
+   if (g_drm_shim_sync_submit) {
+      /* nvFenceWait timeout is in MICROSECONDS (not ns). 2e6 us = 2 s. */
+      Result wr = nvFenceWait(&fence, 2000000LL);
+      SHIM_LOG("EXEC drain chan=%u fence=%u/%u rc=0x%x\n",
+               chan_id, fence.id, fence.value, wr);
+      if (R_FAILED(wr)) {
+         /* The GPU did not finish this submit. Reporting success here told NVK to
+          * keep queueing work onto a channel that is stuck or has already been
+          * reset by the kernel, and the display stack went down with it. Failing
+          * the submit turns that into VK_ERROR_DEVICE_LOST instead. */
+         shim_err("drm_shim: EXEC drain TIMEOUT chan=%u fence=%u/%u rc=0x%x\n",
+                  chan_id, fence.id, fence.value, wr);
+         return -ETIMEDOUT;
+      }
+      {
+         /* An extra ioctl per submit; only worth paying while draining. */
+         u32 cur = 0;
+         Result srr = nvioctlNvhostCtrl_SyncptRead(nvFenceGetFd(), fence.id, &cur);
+         SHIM_LOG("EXEC drain syncpt[%u] current=%u target=%u reached=%d readrc=0x%x\n",
+                  fence.id, (unsigned)cur, fence.value,
+                  (int)(cur >= fence.value), srr);
+      }
+   }
+
+   /* Read the channel error notifier: the kickoff is accepted (rc=0) but the
+    * GPU executes ASYNC and may FAULT (MMU fault / illegal method / PBDMA err),
+    * which resets the channel and makes every later submit return 0xd5c.
+    * info32 = NvNotificationType: 31=MMU fault, 25=GR illegal-method,
+    * 32=PBDMA error, 8=idle timeout, 13=GR SW notify, 0=no fault. */
+   NvNotification notif = {0};
+   if (R_SUCCEEDED(nvGpuChannelGetErrorNotification(&ch->chan, &notif)) &&
+       (notif.info32 || notif.info16)) {
+      SHIM_LOG("EXEC ERRNOTIF chan=%u type=%u info16=%u (31=MMU 25=illegal 32=PBDMA 8=idle)\n",
+               chan_id, notif.info32, notif.info16);
+      /* Dump the detailed error info — for an MMU fault (type 31) this carries
+       * the FAULTING GPU VA (+ engine/client/reason), which tells us EXACTLY
+       * which buffer the 3D init dereferenced that we didn't map. */
+      NvError err;
+      memset(&err, 0, sizeof(err));
+      if (R_SUCCEEDED(nvGpuChannelGetErrorInfo(&ch->chan, &err)))
+         SHIM_LOG("EXEC ERRINFO type=%u info: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                  err.type, err.info[0], err.info[1], err.info[2], err.info[3],
+                  err.info[4], err.info[5], err.info[6], err.info[7],
+                  err.info[8], err.info[9], err.info[10], err.info[11]);
+
+      /* The GPU faulted. The kernel has reset this channel, so every later submit
+       * on it is meaningless; reporting success just kept NVK feeding a dead
+       * channel until the display stack died with it. Surface it instead. */
+      shim_err("drm_shim: GPU FAULT chan=%u type=%u info16=%u "
+               "(31=MMU 25=illegal-method 32=PBDMA 8=idle)\n",
+               chan_id, notif.info32, notif.info16);
+      return -EIO;
+   }
+
+   return 0;
+}
+
+/* Submit every channel's pending batch.
+ *
+ * Called from each path that OBSERVES GPU completion. A deferred batch hands out
+ * no fences, so a waiter that did not flush first would be waiting on a syncobj
+ * whose work is still sitting in our ring -- the wait could only ever time out.
+ * Caller holds g_dev.lock. */
+static void shim_flush_all_locked(void)
+{
+   for (int i = 0; i < SHIM_MAX_CHANNELS; i++) {
+      struct shim_channel *c = &g_dev.channels[i];
+      if (c->used && c->batch_execs)
+         channel_flush_locked(c);
+   }
+}
+
+static void shim_flush_all(void)
+{
+   mutexLock(&g_dev.lock);
+   shim_flush_all_locked();
+   mutexUnlock(&g_dev.lock);
 }
 
 static int nouveau_exec(struct drm_nouveau_exec *req)
@@ -1100,7 +1383,14 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
       (const struct drm_nouveau_sync *)(uintptr_t)req->sig_ptr;
 
    /* CPU-wait the dependencies before submitting. Correct (if coarse): GPU-side
-    * semaphore waits would be the optimization. */
+    * semaphore waits would be the optimization.
+    *
+    * Flush first. A dependency can be signalled by an EXEC sitting in a deferred
+    * batch -- including this channel's own -- and such a syncobj carries no fence
+    * yet, so without the flush this loop would skip it entirely and submit work
+    * that reads buffers the GPU has not written. */
+   if (req->wait_count)
+      shim_flush_all_locked();
    for (uint32_t i = 0; i < req->wait_count; i++) {
       struct shim_syncobj *s = syncobj_lookup(waits[i].handle);
       if (s && s->has_fence)
@@ -1112,15 +1402,32 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
     * succeeded. There is nothing to execute; just signal any sig syncs with the
     * channel's current fence (the last submitted work) and return. */
    if (req->push_count == 0) {
+      /* Flush first, so "the channel's current fence" really does cover all the
+       * work submitted so far. With a batch pending it would otherwise name the
+       * last KICKED-OFF submit and signal these syncobjs complete while the
+       * EXECs before them were still sitting unsubmitted in the ring. */
+      channel_flush_locked(ch);
       NvFence f;
       nvGpuChannelGetFence(&ch->chan, &f);
       for (uint32_t i = 0; i < req->sig_count; i++) {
          struct shim_syncobj *s = syncobj_lookup(sigs[i].handle);
          /* Attach the GPU fence + record the TIMELINE point this submit signals. The point
           * counts as "reached" only when this fence completes (drmSyncobjQuery polls it). */
-         if (s) { s->fence = f; s->has_fence = true; s->signaled = true; s->value = sigs[i].timeline_value; }
+         if (s) { s->fence = f; s->has_fence = true; s->signaled = true; s->pending = false; s->value = sigs[i].timeline_value; }
       }
       return 0;
+   }
+
+   /* Make room before appending. Either of these overflowing would lose work
+    * silently: nvGpuChannelAppendEntry fails once the fixed 2048-entry ring is
+    * full, and a syncobj that does not fit in batch_sig would never receive the
+    * batch's fence (nor be released if the kickoff failed). Both are reachable
+    * only because batching lets state accumulate across EXECs, so both are
+    * resolved the same way -- submit what is already queued and start fresh. */
+   if (ch->batch_execs &&
+       ((uint32_t)ch->chan.num_entries + req->push_count + 2u > SHIM_BATCH_ENTRY_LIMIT ||
+        ch->batch_sig_count + req->sig_count > SHIM_MAX_BATCH_SIGS)) {
+      channel_flush_locked(ch);
    }
 
    /* First real submit on this channel: bind the engine classes to their
@@ -1177,197 +1484,38 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
                               pushes[i].va_len / 4, flags, 0);
    }
 
-   /* STANDARD libnx fence path (matches deko3d + libdrm_nouveau, which use this
-    * and work): request ONE syncpoint increment via IncrFence (sets KickoffPb
-    * BIT(8); the kernel adds the increment). We used to hand-roll an in-stream
-    * fence cmdlist INSTEAD of this — the original "BIT(8) -> 0xd5c" was actually
-    * a DOUBLE increment (IncrFence + our cmdlist together); the cure is to use
-    * exactly ONE, the standard one. The hand-rolled path worked for the 1st
-    * submit but failed the 2nd (fill) — deko's standard path doesn't. */
-   nvGpuChannelIncrFence(&ch->chan);
-
-   /* ⭐ v32: append the BUILTIN FENCE CMDLIST — the actual Maxwell command that
-    * INCREMENTS the syncpt on the GPU (gen_fence_cmdlist: method 0x0B2 with
-    * syncpt_id|incr-bit). IncrFence alone only bumps libnx's expected counter;
-    * WITHOUT this entry the GPU never increments the syncpt, so the completion
-    * fence is never reached. EXACTLY what libdrm_nouveau/pushbuf.c:226-228 does
-    * (and our own selftest T1). The v22 removal of this was the bug (it was made
-    * on the misread 0xd5c=ENOMEM; 0xd5c is really Timeout). The init was masked
-    * because NVK's own pushbuf self-increments; the fill (no self-incr) exposed
-    * it (syncpt stuck). NOT_MAIN|NO_PREFETCH like the reference + the setobj. */
-   nvGpuChannelAppendEntry(&ch->chan, ch->cmdbuf_va, ch->fence_num_cmds,
-                           GPFIFO_ENTRY_NOT_MAIN | GPFIFO_ENTRY_NO_PREFETCH, 0);
-
-   /* Bound outstanding work before kicking off.
+   /* Record what this EXEC promised to signal, and DEFER the kickoff.
     *
-    * MEASURED TRADE-OFF, both on hardware:
-    *   with this wait: 3.7 fps, STABLE,  submit-wait 206 ms/frame (78% of frame)
-    *   without it:     3.0 fps, CRASHES 0xd5c, submit-wait 0 ms/frame
-    * Removing it does eliminate the wait, but the kernel then refuses a submit
-    * outright and kickoff_retry's on-demand back-off cannot recover. Stability
-    * wins until submit COUNT comes down.
-    *
-    * THE REAL PROBLEM IS NOT THIS WAIT, IT IS HOW OFTEN IT IS PAID. A single
-    * nvFenceWait costs ~23 ms here even when the GPU finished in microseconds
-    * (render fences read 1-35 us at present time) -- wakeup latency, about a
-    * vblank and a half, not GPU work. At the 9-24 submits per guest frame this
-    * driver makes, that is 200-550 ms of frame time however the waiting is
-    * arranged. Rearranging the throttle cannot fix it; submitting less can.
-    * Next step is cutting submits per frame in the NVK queue path. */
-   {
-      const uint32_t slot = ch->inflight_head;
-      if (ch->inflight_valid[slot]) {
-         NvFence oldest = ch->inflight[slot];
-         const u64 t_wait0 = armGetSystemTick();
-         Result tr = nvFenceWait(&oldest, 2000000LL);   /* us => 2 s */
-         g_drm_shim_exec_wait_ns += armTicksToNs(armGetSystemTick() - t_wait0);
-         if (R_FAILED(tr)) {
-            SHIM_ERR_FIRST(4, "drm_shim: inflight throttle TIMEOUT chan=%u fence=%u/%u rc=0x%x\n",
-                           (unsigned)req->channel, oldest.id, oldest.value, tr);
-         }
-         ch->inflight_valid[slot] = false;
-      }
-   }
-
-   g_drm_shim_exec_count++;
-   Result rc = kickoff_retry(&ch->chan);
-   SHIM_LOG("EXEC kickoff returned rc=0x%x (chan=%u push_count=%u)\n",
-            rc, (unsigned)req->channel, req->push_count);
-   if (R_FAILED(rc)) {
-      /* This was the one submit-path failure with NO release-build trace at all:
-       * SHIM_LOG compiles out, so a kickoff that failed 400 retries returned
-       * -EIO in complete silence. NVK turns that into a failed vkQueueSubmit,
-       * and the consumer responds by recreating the swapchain. Any hunt for what
-       * starts that chain has to be able to see this. */
-      SHIM_ERR_FIRST(8, "drm_shim: EXEC KICKOFF FAILED rc=0x%x chan=%u push_count=%u\n",
-               rc, (unsigned)req->channel, req->push_count);
-
-      /* RESET THE CHANNEL, THEN DROP THE SUBMIT.
-       *
-       * Returning -EIO makes NVK fail the vkQueueSubmit, which the consumer turns
-       * into abort() -- so ONE refused submit ends the run. 0xd5c is intermittent,
-       * which is the whole reason "how far it gets" varies between identical
-       * builds. Measured: this path aborts on failure #1, whereas resetting and
-       * continuing survived 8 failures in a run.
-       *
-       * A failed kickoff does NOT clear what was appended, and that turns one
-       * refusal into a permanently poisoned channel:
-       *   entries=2 incr=1 -> 4/2 -> 6/3 -> 8/4   (accumulating)
-       * `entries` climbs because libnx leaves num_entries alone on ioctl failure,
-       * so the next nouveau_exec appends on top of the dead submit; fence_incr
-       * stacks the same way and chan->fence.value freezes. Dropping work is only
-       * safe once that state is cleared -- which is why these belong together and
-       * were measured together.
-       *
-       * engines_bound is re-armed because the SET_OBJECT binds ride on the first
-       * submit; discarding it without re-emitting them would leave NVK methods
-       * hitting an unbound subchannel -> MMU fault -> dead channel.
-       *
-       * The signalled syncobjs MUST be complete-with-NO-fence: attaching the
-       * channel fence would point them at a syncpoint value the GPU never reaches
-       * (this work was never submitted) and anything waiting would hang forever --
-       * worse than the abort being replaced. */
-      ch->chan.num_entries = 0;
-      ch->chan.fence_incr = 0;
-      ch->engines_bound = false;
-      for (uint32_t i = 0; i < req->sig_count; i++) {
-         struct shim_syncobj *s = syncobj_lookup(sigs[i].handle);
-         if (s) {
-            s->has_fence = false;
-            s->signaled = true;
-            s->value = sigs[i].timeline_value;
-         }
-      }
-      return 0;
-   }
-
-   /* The real completion fence: kickoff advanced c->fence by the increment. */
-   NvFence fence;
-   nvGpuChannelGetFence(&ch->chan, &fence);
-
-   ch->inflight[ch->inflight_head] = fence;
-   ch->inflight_valid[ch->inflight_head] = true;
-   ch->inflight_head = (ch->inflight_head + 1) % SHIM_MAX_INFLIGHT;
-
-   /* v32: the v31 -1 hack is REVERTED — with the fence cmdlist appended above,
-    * the GPU actually reaches the full GetFence value (as in the reference), so
-    * use it as-is. (v31 confirmed the init off-by-one was only the missing
-    * trailing increment, now provided by the cmdlist.) */
+    * The syncobjs are left explicitly NOT complete and WITHOUT a fence. The
+    * immediate-kickoff version could mark them signalled here because by this
+    * point it had already submitted; we have not, so doing the same would tell
+    * NVK the GPU was finished with buffers it has not even been handed -- it
+    * would recycle them under a still-pending draw. `pending` records that the
+    * real fence is owed, and every path that observes completion flushes first,
+    * which is what pays it. */
    for (uint32_t i = 0; i < req->sig_count; i++) {
       struct shim_syncobj *s = syncobj_lookup(sigs[i].handle);
-      if (s) { s->fence = fence; s->has_fence = true; s->signaled = true; }
+      if (!s)
+         continue;
+      s->value     = sigs[i].timeline_value;
+      s->has_fence = false;
+      s->signaled  = false;
+      s->pending   = true;
+      /* Capacity was made above, so this cannot drop a handle. */
+      if (ch->batch_sig_count < SHIM_MAX_BATCH_SIGS)
+         ch->batch_sig[ch->batch_sig_count++] = sigs[i].handle;
    }
 
-   /* Optional synchronous drain -- OFF by default.
-    *
-    * This used to block on EVERY submit until the GPU had fully finished it,
-    * which means the CPU and GPU never overlapped: no pipelining, no queueing,
-    * one submit at a time. It was a bring-up crutch -- it made a GPU execution
-    * fault surface here as a timeout instead of as a mysterious failure of the
-    * NEXT submit, and it papered over a 0xd5c that has since been fixed properly
-    * by priming the channel in nouveau_channel_alloc.
-    *
-    * The correctness it provided is not lost: NVK still gets a real fence on
-    * every signalled syncobj (attached above), so anything that actually needs
-    * completion waits on it. The error-notifier check below still runs and still
-    * reports a GPU fault; it just no longer costs a full GPU round-trip per
-    * submit.
-    *
-    * Set to 1 to restore the old lock-step behaviour when debugging a suspected
-    * GPU execution fault. */
-   if (g_drm_shim_sync_submit) {
-      /* nvFenceWait timeout is in MICROSECONDS (not ns). 2e6 us = 2 s. */
-      Result wr = nvFenceWait(&fence, 2000000LL);
-      SHIM_LOG("EXEC drain chan=%u fence=%u/%u rc=0x%x\n",
-               (unsigned)req->channel, fence.id, fence.value, wr);
-      if (R_FAILED(wr)) {
-         /* The GPU did not finish this submit. Reporting success here told NVK to
-          * keep queueing work onto a channel that is stuck or has already been
-          * reset by the kernel, and the display stack went down with it. Failing
-          * the submit turns that into VK_ERROR_DEVICE_LOST instead. */
-         shim_err("drm_shim: EXEC drain TIMEOUT chan=%u fence=%u/%u rc=0x%x\n",
-                  (unsigned)req->channel, fence.id, fence.value, wr);
-         return -ETIMEDOUT;
-      }
-      {
-         /* An extra ioctl per submit; only worth paying while draining. */
-         u32 cur = 0;
-         Result srr = nvioctlNvhostCtrl_SyncptRead(nvFenceGetFd(), fence.id, &cur);
-         SHIM_LOG("EXEC drain syncpt[%u] current=%u target=%u reached=%d readrc=0x%x\n",
-                  fence.id, (unsigned)cur, fence.value,
-                  (int)(cur >= fence.value), srr);
-      }
-   }
+   ch->batch_execs++;
+   g_drm_shim_exec_count++;
 
-   /* Read the channel error notifier: the kickoff is accepted (rc=0) but the
-    * GPU executes ASYNC and may FAULT (MMU fault / illegal method / PBDMA err),
-    * which resets the channel and makes every later submit return Timeout
-    * (0xd5c). info32 = NvNotificationType: 31=MMU fault, 25=GR illegal-method,
-    * 32=PBDMA error, 8=idle timeout, 13=GR SW notify, 0=no fault. */
-   NvNotification notif = {0};
-   if (R_SUCCEEDED(nvGpuChannelGetErrorNotification(&ch->chan, &notif)) &&
-       (notif.info32 || notif.info16)) {
-      SHIM_LOG("EXEC ERRNOTIF chan=%u type=%u info16=%u (31=MMU 25=illegal 32=PBDMA 8=idle)\n",
-               (unsigned)req->channel, notif.info32, notif.info16);
-      /* Dump the detailed error info — for an MMU fault (type 31) this carries
-       * the FAULTING GPU VA (+ engine/client/reason), which tells us EXACTLY
-       * which buffer the 3D init dereferenced that we didn't map. */
-      NvError err;
-      memset(&err, 0, sizeof(err));
-      if (R_SUCCEEDED(nvGpuChannelGetErrorInfo(&ch->chan, &err)))
-         SHIM_LOG("EXEC ERRINFO type=%u info: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                  err.type, err.info[0], err.info[1], err.info[2], err.info[3],
-                  err.info[4], err.info[5], err.info[6], err.info[7],
-                  err.info[8], err.info[9], err.info[10], err.info[11]);
-
-      /* The GPU faulted. The kernel has reset this channel, so every later submit
-       * on it is meaningless; reporting success just kept NVK feeding a dead
-       * channel until the display stack died with it. Surface it instead. */
-      shim_err("drm_shim: GPU FAULT chan=%u type=%u info16=%u "
-               "(31=MMU 25=illegal-method 32=PBDMA 8=idle)\n",
-               (unsigned)req->channel, notif.info32, notif.info16);
-      return -EIO;
-   }
+   /* Submit once the batch is full. Everything else is flushed on demand by a
+    * waiter, so work is never stranded -- but waiting for a waiter EVERY time
+    * would leave the GPU idle while the CPU builds the rest of the frame, and
+    * this port is GPU-bound. The cap keeps the GPU fed while still collapsing
+    * the 7-11 EXECs of a guest frame into a couple of kickoffs. */
+   if (ch->batch_execs >= shim_batch_max())
+      return channel_flush_locked(ch);
 
    return 0;
 }
@@ -1672,7 +1820,7 @@ int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count)
    mutexLock(&g_dev.lock);
    for (uint32_t i = 0; i < handle_count; i++) {
       struct shim_syncobj *s = syncobj_lookup(handles[i]);
-      if (s) { s->signaled = false; s->value = 0; s->has_fence = false; }
+      if (s) { s->signaled = false; s->value = 0; s->has_fence = false; s->pending = false; }
    }
    mutexUnlock(&g_dev.lock);
    return 0;
@@ -1712,9 +1860,19 @@ int drmSyncobjQuery(int fd, uint32_t *handles,
     * from reusing a BO the GPU still reads (a too-high value = corruption); the
     * worst case of "0 while pending" is just an extra fresh BO, never unsafe.
     * Snapshot the fence under the lock, poll it (0 timeout) OUTSIDE the lock. */
+   shim_flush_all();   /* a deferred batch still owes these syncobjs their fences */
    for (uint32_t i = 0; i < handle_count; i++) {
       mutexLock(&g_dev.lock);
       struct shim_syncobj *s = syncobj_lookup(handles[i]);
+      /* Still pending => another thread deferred an EXEC signalling it after the
+       * flush above. Resolve it HERE, under the lock, where the race cannot
+       * reopen: "no fence" is read below as "already reached", which is true of
+       * a never-submitted syncobj but catastrophically false for one whose work
+       * is merely sitting in a batch. */
+      if (s && s->pending) {
+         shim_flush_all_locked();
+         s = syncobj_lookup(handles[i]);
+      }
       bool     has_fence = s && s->has_fence;
       uint64_t value     = s ? s->value : 0;
       NvFence  fence     = has_fence ? s->fence : (NvFence){0};
@@ -1745,11 +1903,25 @@ int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
    const bool wait_all = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) != 0;
    int ret = 0;
 
+   /* Submit any deferred batch before waiting on it.
+    *
+    * This is the flush point that matters: it is where the consumer blocks for
+    * its frame, so it is where a batch normally gets paid off. Skipping it would
+    * mean waiting on syncobjs whose work is still sitting unsubmitted in our own
+    * ring -- a wait that could only ever time out. */
+   shim_flush_all();
+
    for (unsigned i = 0; i < num_handles; i++) {
       /* Snapshot the fence under the lock, then block on the GPU WITHOUT the
        * lock held — otherwise a long wait would stall other threads' submits. */
       mutexLock(&g_dev.lock);
       struct shim_syncobj *s = syncobj_lookup(handles[i]);
+      /* See drmSyncobjQuery: resolve a raced deferral under the lock, so that
+       * "no fence" below cannot mean "still queued in a batch". */
+      if (s && s->pending) {
+         shim_flush_all_locked();
+         s = syncobj_lookup(handles[i]);
+      }
       bool    has_fence = s && s->has_fence;
       NvFence fence     = has_fence ? s->fence : (NvFence){0};
       mutexUnlock(&g_dev.lock);

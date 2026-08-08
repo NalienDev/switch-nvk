@@ -108,7 +108,11 @@ uint64_t g_drm_shim_kickoff_count = 0; /* actual nvGpuChannelKickoff calls      
  * Set to 1 to get exactly the old one-kickoff-per-EXEC behaviour back -- the A/B
  * control for this change, since every previous submit-path theory here was
  * settled by a hardware A/B rather than by reasoning. */
-int g_drm_shim_batch_max = 8;
+/* DEFAULT 1 = OFF. Batching is implemented and correct, but on hardware it
+ * measurably destabilises this port: with it live the run takes 8 kickoff
+ * failures and never reaches the main menu, while the identical build with
+ * this at 1 takes zero and plays. Raise it only alongside a hardware A/B. */
+int g_drm_shim_batch_max = 1;
 static void shim_err(const char *fmt, ...)
 {
    char buf[192];
@@ -1258,6 +1262,25 @@ static int channel_flush_locked(struct shim_channel *ch)
       }
       ch->batch_sig_count = 0;
       ch->batch_execs = 0;
+
+      /* KEEP THE THROTTLE ARMED ACROSS A FAILURE.
+       *
+       * This path used to return without recording an in-flight fence, so after
+       * the very first 0xd5c the depth-1 throttle had nothing left to wait on
+       * and never engaged again. Measured on hardware: submit-wait collapses to
+       * 0.33 ms/frame (0% of frame) from 15-18 ms (36-55%), and failures
+       * multiply to 8 in a run. Dropping back-pressure at exactly the moment
+       * the kernel is refusing submits is backwards -- it guarantees the next
+       * submit arrives sooner than the last one that was already refused.
+       *
+       * chan.fence, NOT nvGpuChannelGetFence(): that returns value + fence_incr,
+       * the target THIS failed submit would have reached, and the GPU never
+       * will because the work was never kicked off -- waiting on it can only
+       * time out. chan.fence is what previously ACCEPTED kickoffs asked the GPU
+       * to reach, so it is reachable and waiting on it is real back-pressure. */
+      ch->inflight[ch->inflight_head] = ch->chan.fence;
+      ch->inflight_valid[ch->inflight_head] = true;
+      ch->inflight_head = (ch->inflight_head + 1) % SHIM_MAX_INFLIGHT;
       return 0;
    }
 

@@ -83,6 +83,22 @@ void (*g_drm_shim_err_sink)(const char *) = NULL;
 /* Block on the GPU after every submit. Bring-up crutch, OFF by default: leaving
  * it on serialises the CPU against the GPU completely (see nouveau_exec). Flip
  * to 1 to make a GPU execution fault surface at the submit that caused it. */
+/* 0 = off, 1 = drain after every kickoff, N = drain after every Nth.
+ *
+ * Now a PERIOD rather than a flag, because of what the sub-native rendering
+ * runs showed. 0xd5c fires when frames are cheap and does not when they are
+ * expensive, at an IDENTICAL submit rate -- so the variable is not how often we
+ * submit, it is whether the CPU ever BLOCKS. An expensive frame blocks 15-200 ms
+ * per frame in nvFenceWait; a cheap one blocks 0.4 ms. If nvgpu retires finished
+ * jobs on the back of blocking syncpoint waits, then a GPU that keeps up means
+ * nothing ever reaps, and the per-submit allocation eventually fails -- which is
+ * exactly the failure, and exactly why the 40 s retry budget never helped
+ * (kickoff_retry waits on chan->fence, already reached, so it returns at once
+ * and never really waits).
+ *
+ * A period lets that be traded off instead of being all-or-nothing: draining
+ * every submit serialises CPU and GPU completely, but draining every 4th or 8th
+ * reintroduces blocking waits at a fraction of the cost. */
 int g_drm_shim_sync_submit = 0;
 
 /* Submit-path counters, read by the consumer's per-guest-frame profiler.
@@ -1309,7 +1325,9 @@ static int channel_flush_locked(struct shim_channel *ch)
     *
     * Set to 1 to restore the old lock-step behaviour when debugging a suspected
     * GPU execution fault. */
-   if (g_drm_shim_sync_submit) {
+   const int sync_period = g_drm_shim_sync_submit;
+   static uint64_t s_kickoffs_since_drain = 0;
+   if (sync_period > 0 && (++s_kickoffs_since_drain % (uint64_t)sync_period) == 0) {
       /* nvFenceWait timeout is in MICROSECONDS (not ns). 2e6 us = 2 s. */
       Result wr = nvFenceWait(&fence, 2000000LL);
       SHIM_LOG("EXEC drain chan=%u fence=%u/%u rc=0x%x\n",

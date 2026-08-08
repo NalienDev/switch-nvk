@@ -214,6 +214,7 @@ struct shim_syncobj {
     * GPU has not been given. Every path that observes completion flushes first,
     * which turns this into a real fence. */
    bool     pending;
+   uint32_t pending_chan;  /* channel id owing the fence while pending        */
 };
 
 /* A real libnx GPFIFO channel + the builtin cmdbuf carrying the Maxwell
@@ -1127,7 +1128,7 @@ static int nouveau_vm_bind(struct drm_nouveau_vm_bind *req)
    for (uint32_t i = 0; i < req->sig_count; i++) {
       struct shim_syncobj *s = syncobj_lookup(sigs[i].handle);
       /* empty EXEC: signal immediately (no GPU work) -> the timeline point is reached now. */
-      if (s) { s->signaled = true; s->has_fence = false; s->pending = false; s->value = sigs[i].timeline_value; }
+      if (s) { s->signaled = true; s->has_fence = false; s->pending = false; s->pending_chan = 0; s->value = sigs[i].timeline_value; }
    }
    return 0;
 }
@@ -1253,7 +1254,7 @@ static int channel_flush_locked(struct shim_channel *ch)
       ch->engines_bound = false;
       for (uint32_t i = 0; i < ch->batch_sig_count; i++) {
          struct shim_syncobj *s = syncobj_lookup(ch->batch_sig[i]);
-         if (s) { s->has_fence = false; s->signaled = true; s->pending = false; }
+         if (s) { s->has_fence = false; s->signaled = true; s->pending = false; s->pending_chan = 0; }
       }
       ch->batch_sig_count = 0;
       ch->batch_execs = 0;
@@ -1270,7 +1271,7 @@ static int channel_flush_locked(struct shim_channel *ch)
 
    for (uint32_t i = 0; i < ch->batch_sig_count; i++) {
       struct shim_syncobj *s = syncobj_lookup(ch->batch_sig[i]);
-      if (s) { s->fence = fence; s->has_fence = true; s->signaled = true; s->pending = false; }
+      if (s) { s->fence = fence; s->has_fence = true; s->signaled = true; s->pending = false; s->pending_chan = 0; }
    }
    ch->batch_sig_count = 0;
    ch->batch_execs = 0;
@@ -1357,13 +1358,6 @@ static void shim_flush_all_locked(void)
    }
 }
 
-static void shim_flush_all(void)
-{
-   mutexLock(&g_dev.lock);
-   shim_flush_all_locked();
-   mutexUnlock(&g_dev.lock);
-}
-
 static int nouveau_exec(struct drm_nouveau_exec *req)
 {
    struct shim_channel *ch = channel_lookup((uint32_t)req->channel);
@@ -1385,12 +1379,31 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
    /* CPU-wait the dependencies before submitting. Correct (if coarse): GPU-side
     * semaphore waits would be the optimization.
     *
-    * Flush first. A dependency can be signalled by an EXEC sitting in a deferred
-    * batch -- including this channel's own -- and such a syncobj carries no fence
-    * yet, so without the flush this loop would skip it entirely and submit work
-    * that reads buffers the GPU has not written. */
-   if (req->wait_count)
-      shim_flush_all_locked();
+    * A dependency signalled by an EXEC still sitting in a deferred batch has no
+    * fence yet, and must not be silently skipped -- that would submit work
+    * reading buffers the GPU has not written. But how it is resolved decides
+    * whether batching happens at all:
+    *
+    *   SAME channel  -> nothing to do. The GPFIFO executes in order, so work
+    *                    appended earlier in this batch is guaranteed to run
+    *                    before what we are appending now. No flush, no wait.
+    *   OTHER channel -> flush THAT channel so the dependency acquires a real
+    *                    fence, then wait on it below.
+    *
+    * The first version flushed everything whenever wait_count was non-zero.
+    * NVK attaches a dependency syncobj to essentially every submit, so that
+    * flushed the batch on every single EXEC and batching did nothing at all:
+    * hardware measured kickoffs/frame EXACTLY equal to execs/frame (6.4/6.4,
+    * 9.4/9.4). Same-channel dependencies are the common case and they are free. */
+   const uint32_t this_chan = (uint32_t)req->channel;
+   for (uint32_t i = 0; i < req->wait_count; i++) {
+      struct shim_syncobj *s = syncobj_lookup(waits[i].handle);
+      if (s && s->pending && s->pending_chan != this_chan) {
+         struct shim_channel *dep = channel_lookup(s->pending_chan);
+         if (dep)
+            channel_flush_locked(dep);
+      }
+   }
    for (uint32_t i = 0; i < req->wait_count; i++) {
       struct shim_syncobj *s = syncobj_lookup(waits[i].handle);
       if (s && s->has_fence)
@@ -1413,7 +1426,7 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
          struct shim_syncobj *s = syncobj_lookup(sigs[i].handle);
          /* Attach the GPU fence + record the TIMELINE point this submit signals. The point
           * counts as "reached" only when this fence completes (drmSyncobjQuery polls it). */
-         if (s) { s->fence = f; s->has_fence = true; s->signaled = true; s->pending = false; s->value = sigs[i].timeline_value; }
+         if (s) { s->fence = f; s->has_fence = true; s->signaled = true; s->pending = false; s->pending_chan = 0; s->value = sigs[i].timeline_value; }
       }
       return 0;
    }
@@ -1501,6 +1514,7 @@ static int nouveau_exec(struct drm_nouveau_exec *req)
       s->has_fence = false;
       s->signaled  = false;
       s->pending   = true;
+      s->pending_chan = (uint32_t)req->channel;
       /* Capacity was made above, so this cannot drop a handle. */
       if (ch->batch_sig_count < SHIM_MAX_BATCH_SIGS)
          ch->batch_sig[ch->batch_sig_count++] = sigs[i].handle;
@@ -1820,7 +1834,7 @@ int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count)
    mutexLock(&g_dev.lock);
    for (uint32_t i = 0; i < handle_count; i++) {
       struct shim_syncobj *s = syncobj_lookup(handles[i]);
-      if (s) { s->signaled = false; s->value = 0; s->has_fence = false; s->pending = false; }
+      if (s) { s->signaled = false; s->value = 0; s->has_fence = false; s->pending = false; s->pending_chan = 0; }
    }
    mutexUnlock(&g_dev.lock);
    return 0;
@@ -1860,7 +1874,6 @@ int drmSyncobjQuery(int fd, uint32_t *handles,
     * from reusing a BO the GPU still reads (a too-high value = corruption); the
     * worst case of "0 while pending" is just an extra fresh BO, never unsafe.
     * Snapshot the fence under the lock, poll it (0 timeout) OUTSIDE the lock. */
-   shim_flush_all();   /* a deferred batch still owes these syncobjs their fences */
    for (uint32_t i = 0; i < handle_count; i++) {
       mutexLock(&g_dev.lock);
       struct shim_syncobj *s = syncobj_lookup(handles[i]);
@@ -1902,14 +1915,6 @@ int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
       timeout_us = 3000000;
    const bool wait_all = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) != 0;
    int ret = 0;
-
-   /* Submit any deferred batch before waiting on it.
-    *
-    * This is the flush point that matters: it is where the consumer blocks for
-    * its frame, so it is where a batch normally gets paid off. Skipping it would
-    * mean waiting on syncobjs whose work is still sitting unsubmitted in our own
-    * ring -- a wait that could only ever time out. */
-   shim_flush_all();
 
    for (unsigned i = 0; i < num_handles; i++) {
       /* Snapshot the fence under the lock, then block on the GPU WITHOUT the

@@ -1328,8 +1328,16 @@ static int channel_flush_locked(struct shim_channel *ch)
    const int sync_period = g_drm_shim_sync_submit;
    static uint64_t s_kickoffs_since_drain = 0;
    if (sync_period > 0 && (++s_kickoffs_since_drain % (uint64_t)sync_period) == 0) {
-      /* nvFenceWait timeout is in MICROSECONDS (not ns). 2e6 us = 2 s. */
+      /* nvFenceWait timeout is in MICROSECONDS (not ns). 2e6 us = 2 s.
+       *
+       * Counted into exec_wait_ns like the throttle. It was NOT, and that made
+       * the drain's cost invisible: a full pipeline flush several times a frame
+       * showed up nowhere, so GUESTFRAME's "submit-wait" understated GPU
+       * blocking and the remainder looked like CPU time. Anything that blocks
+       * on the GPU has to be in this number or the frame breakdown lies. */
+      const u64 t_drain0 = armGetSystemTick();
       Result wr = nvFenceWait(&fence, 2000000LL);
+      g_drm_shim_exec_wait_ns += armTicksToNs(armGetSystemTick() - t_drain0);
       SHIM_LOG("EXEC drain chan=%u fence=%u/%u rc=0x%x\n",
                chan_id, fence.id, fence.value, wr);
       if (R_FAILED(wr)) {
